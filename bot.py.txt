@@ -1,8 +1,10 @@
 import requests
 import time
 
-BOT_TOKEN = "8493651620:AAEMBlQkKHj4rjYBJEjBms_NlI8sbLPLNXk"
-CHAT_ID = "6195588874"
+import os
+
+BOT_TOKEN = os.environ["8493651620:AAEMBlQkKHj4rjYBJEjBms_NlI8sbLPLNXk"]
+CHAT_ID = os.environ["6195588874"]
 
 GRAPH_URL = "https://api.thegraph.com/subgraphs/name/polymarket/matic-markets"
 
@@ -39,7 +41,7 @@ while True:
             amount = float(t['collateralAmountUSD'])
             price = float(t['price'])
 
-            if amount > 10000 and price < 0.15:
+            if amount > 5000 and price < 0.15:
                 msg = f"""
 🐋 КРУПНЫЙ ВХОД ЗА КОПЕЙКИ
 
@@ -57,3 +59,4 @@ while True:
         print("Error:", e)
 
         time.sleep(60)
+
