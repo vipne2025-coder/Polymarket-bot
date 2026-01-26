@@ -50,7 +50,7 @@ while True:
 Цена: {price}
 Кошелёк: {t['trader']}
 """
-                send_telegram( Бот запустился и на связи.)
+                send_telegram( "Бот запустился и на связи.")
                 seen.add(trade_id)
 
         time.sleep(60)
@@ -59,5 +59,6 @@ while True:
         print("Error:", e)
 
         time.sleep(60)
+
 
 
