@@ -26,5 +26,6 @@ def main() -> None:
         print("Tick", flush=True)
         time.sleep(15)
 
-if name == "main":
+if __name__== "main":
     main()
+
