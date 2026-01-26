@@ -78,5 +78,14 @@ def main():
             time.sleep(60)
 
 if __name__ == "main":
-    main()
+    def main():
+    while True:
+        try:
+            print("Tick: bot is alive", flush=True)
+            send_telegram("Bot is alive (test)")
+            time.sleep(10)
+        except Exception as e:
+            print("Error:", repr(e), flush=True)
+            time.sleep(10)
+
 
