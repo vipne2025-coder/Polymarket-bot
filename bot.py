@@ -89,3 +89,5 @@ if __name__ == "main":
             time.sleep(10)
 
 
+if __name__ == "main":
+    main()
