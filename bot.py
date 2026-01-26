@@ -12,7 +12,8 @@ def send_message(chat_id, text):
     }
     requests.post(url, data=data)
 
-if name == "main":
+if __name__ == "main":
     print("Bot started")
     while True:
         time.sleep(10)
+
