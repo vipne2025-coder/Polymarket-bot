@@ -77,5 +77,6 @@ def main():
             print("Error:", repr(e))
             time.sleep(60)
 
-if name == "main":
+if __name__ == "main":
     main()
+
