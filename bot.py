@@ -13,7 +13,13 @@ if not TG_TOKEN or not TG_CHAT_ID:
     raise RuntimeError("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars")
 
 MIN_USD = float(os.environ.get("MIN_CASH_USD", "3000"))
+
+# Метка CHEAP (как раньше; это НЕ фильтр, а просто тег)
 CHEAP_PRICE = float(os.environ.get("MAX_CHEAP_PRICE", "0.15"))
+
+# НОВОЕ: фильтр по цене сделки (всё дороже — игнорируем)
+MAX_ENTRY_PRICE = float(os.environ.get("MAX_ENTRY_PRICE", "0.40"))
+
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "15"))
 TRADES_LIMIT = int(os.environ.get("TRADES_LIMIT", "100"))
 
@@ -22,7 +28,6 @@ TG_SEND_URL = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 
 # дедуп по уникальному ключу сделки
 seen: set[Tuple[Any, ...]] = set()
-
 
 # =========================
 # Telegram
@@ -39,10 +44,8 @@ def tg_send(text: str) -> None:
         },
         timeout=20,
     )
-    # если Telegram не принял — будет видно в логах Railway
     if r.status_code != 200:
         print("TG_ERROR", r.status_code, r.text[:300], flush=True)
-
 
 # =========================
 # Polymarket Data API
@@ -62,10 +65,8 @@ def request_json(url: str, params: dict, retries: int = 3) -> Any:
             time.sleep(2 * (i + 1))
     raise RuntimeError(last_err or "unknown error")
 
-
 def fetch_trades() -> List[Dict[str, Any]]:
-    # ВАЖНО: filterType=CASH + filterAmount фильтруют по денежной сумме сделки на стороне API,
-    # но мы всё равно пересчитываем notional на всякий случай.
+    # API-фильтр по денежной сумме сделки (но мы всё равно пересчитываем notional)
     params = {
         "limit": TRADES_LIMIT,
         "filterType": "CASH",
@@ -76,16 +77,14 @@ def fetch_trades() -> List[Dict[str, Any]]:
         raise RuntimeError(f"Unexpected /trades response type: {type(data)}")
     return data
 
-
 def to_float(x: Any) -> float:
     try:
         return float(x)
     except Exception:
         return 0.0
 
-
 def trade_key(t: Dict[str, Any]) -> Tuple[Any, ...]:
-    # Поля могут различаться; делаем устойчивый ключ.
+    # Устойчивый ключ (поля могут быть пустыми/разными)
     return (
         t.get("transactionHash"),
         t.get("tradeId"),
@@ -97,25 +96,18 @@ def trade_key(t: Dict[str, Any]) -> Tuple[Any, ...]:
         t.get("slug"),
     )
 
-
-def format_signal(t: Dict[str, Any]) -> str:
-    price = to_float(t.get("price"))
-    size = to_float(t.get("size"))
-    notional = price * size  # приближенно, но работает стабильно
-
+def format_signal(t: Dict[str, Any], price: float, size: float, notional: float) -> str:
     title = (t.get("title") or "").strip()
     outcome = (t.get("outcome") or "").strip()
     side = (t.get("side") or "").strip()
     slug = (t.get("slug") or "").strip()
 
-    tags = []
-    if price > 0 and price < CHEAP_PRICE:
-        tags.append("CHEAP")
-    tags.append("BIG")
+    tags = ["BIG"]
+    if 0 < price < CHEAP_PRICE:
+        tags.insert(0, "CHEAP")  # CHEAP,BIG
 
     link = f"https://polymarket.com/market/{slug}" if slug else "https://polymarket.com/"
 
-    # Очень коротко и по делу
     return (
         f"[{','.join(tags)}] {title}\n"
         f"{outcome} | {side}\n"
@@ -123,19 +115,19 @@ def format_signal(t: Dict[str, Any]) -> str:
         f"{link}"
     )
 
-
 # =========================
 # Main loop
 # =========================
 def main() -> None:
-    tg_send(f"Bot started. MIN_USD={MIN_USD}, CHEAP< {CHEAP_PRICE}, poll={POLL_SECONDS}s")
+    tg_send(
+        f"Bot started. MIN_USD={MIN_USD}, MAX_ENTRY_PRICE={MAX_ENTRY_PRICE}, "
+        f"CHEAP<{CHEAP_PRICE}, poll={POLL_SECONDS}s"
+    )
 
     while True:
         try:
             trades = fetch_trades()
-
-            # чтобы сообщения шли по времени (старые -> новые)
-            trades = list(reversed(trades))
+            trades = list(reversed(trades))  # старые -> новые
 
             sent_count = 0
             for t in trades:
@@ -145,32 +137,31 @@ def main() -> None:
 
                 price = to_float(t.get("price"))
                 size = to_float(t.get("size"))
-                notional = price * size
+                notional = price * size  # приближённо, но стабильно
 
-                # финальная страховка
-                if notional >= MIN_USD and price > 0:
-                    tg_send(format_signal(t))
+                # ФИЛЬТР: сумма + цена сделки <= 0.40
+                if notional >= MIN_USD and 0 < price <= MAX_ENTRY_PRICE:
+                    tg_send(format_signal(t, price, size, notional))
                     sent_count += 1
 
                 seen.add(k)
 
-            print(f"Tick: fetched={len(trades)} sent={sent_count} seen={len(seen)}", flush=True)
+            print(
+                f"Tick: fetched={len(trades)} sent={sent_count} seen={len(seen)}",
+                flush=True
+            )
 
-            # ограничим память
             if len(seen) > 8000:
-                # сброс без сложностей — норм для realtime
                 seen.clear()
 
         except Exception as e:
             print("ERROR", repr(e), flush=True)
-            # один короткий алерт, чтобы ты видел, что бот жив, но API глючит
             try:
                 tg_send(f"Scanner error: {repr(e)[:900]}")
             except Exception:
                 pass
 
         time.sleep(POLL_SECONDS)
-
 
 if __name__ == "__main__":
     main()
