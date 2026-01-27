@@ -73,7 +73,7 @@ MIN_PRICE = float(os.environ.get("MIN_PRICE", "0.05"))
 # скорость/свежесть
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "12"))
 TRADES_LIMIT = int(os.environ.get("TRADES_LIMIT", "140"))
-MAX_TRADE_AGE_SEC = int(os.environ.get("MAX_TRADE_AGE_SEC", "250"))
+MAX_TRADE_AGE_SEC = int(os.environ.get("MAX_TRADE_AGE_SEC", "300"))
 
 # меньше спама
 MARKET_COOLDOWN_SEC = int(os.environ.get("MARKET_COOLDOWN_SEC", "240"))
@@ -606,4 +606,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
