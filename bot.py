@@ -1,280 +1,176 @@
 import os
 import time
-import json
-import threading
-from datetime import datetime, timezone
-
 import requests
-import websocket
+from typing import Any, Dict, List, Optional, Tuple
 
-# =======================
-# ENV
-# =======================
-TG_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-if not TG_TOKEN or not CHAT_ID:
-    raise RuntimeError("Set TELEGRAM_TOKEN and CHAT_ID env vars")
+# =========================
+# Config (через env)
+# =========================
+TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
+if not TG_TOKEN or not TG_CHAT_ID:
+    raise RuntimeError("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars")
 
-# =======================
-# SETTINGS
-# =======================
-# Whale-trade (Subgraph) filter
-SUBGRAPH_URL = "https://api.thegraph.com/subgraphs/name/polymarket/matic-markets"
-MIN_USD = 3000
-MAX_PRICE = 0.15
-SUBGRAPH_POLL_SEC = 30
+MIN_USD = float(os.environ.get("MIN_CASH_USD", "3000"))
+CHEAP_PRICE = float(os.environ.get("MAX_CHEAP_PRICE", "0.15"))
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "15"))
+TRADES_LIMIT = int(os.environ.get("TRADES_LIMIT", "100"))
 
-# Fast-move (WebSocket) filter
-PRICE_LIMIT = 0.15          # only watch moves while price < 0.15
-MOVE_PCT = 0.02             # 2% jump
-MOVE_WINDOW_SEC = 5         # approximate window by comparing last seen values
+DATA_API_TRADES = "https://data-api.polymarket.com/trades"
+TG_SEND_URL = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 
-WS_URL = "wss://clob.polymarket.com/ws"
+# дедуп по уникальному ключу сделки
+seen: set[Tuple[Any, ...]] = set()
 
-# =======================
+
+# =========================
 # Telegram
-# =======================
+# =========================
 def tg_send(text: str) -> None:
     if len(text) > 3500:
         text = text[:3500] + "\n...[truncated]"
     r = requests.post(
-        f"{TG_API}/sendMessage",
-        data={"chat_id": CHAT_ID, "text": text},
+        TG_SEND_URL,
+        data={
+            "chat_id": TG_CHAT_ID,
+            "text": text,
+            "disable_web_page_preview": "true",
+        },
         timeout=20,
     )
+    # если Telegram не принял — будет видно в логах Railway
     if r.status_code != 200:
-        print("Telegram error:", r.status_code, r.text, flush=True)
+        print("TG_ERROR", r.status_code, r.text[:300], flush=True)
 
-# =======================
-# Helpers
-# =======================
-def iso(ts: int) -> str:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
-def safe_float(x, default=0.0) -> float:
+# =========================
+# Polymarket Data API
+# =========================
+def request_json(url: str, params: dict, retries: int = 3) -> Any:
+    last_err: Optional[str] = None
+    for i in range(retries):
+        try:
+            r = requests.get(url, params=params, timeout=20)
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+                time.sleep(2 * (i + 1))
+                continue
+            return r.json()
+        except Exception as e:
+            last_err = repr(e)
+            time.sleep(2 * (i + 1))
+    raise RuntimeError(last_err or "unknown error")
+
+
+def fetch_trades() -> List[Dict[str, Any]]:
+    # ВАЖНО: filterType=CASH + filterAmount фильтруют по денежной сумме сделки на стороне API,
+    # но мы всё равно пересчитываем notional на всякий случай.
+    params = {
+        "limit": TRADES_LIMIT,
+        "filterType": "CASH",
+        "filterAmount": MIN_USD,
+    }
+    data = request_json(DATA_API_TRADES, params=params, retries=3)
+    if not isinstance(data, list):
+        raise RuntimeError(f"Unexpected /trades response type: {type(data)}")
+    return data
+
+
+def to_float(x: Any) -> float:
     try:
         return float(x)
     except Exception:
-        return default
+        return 0.0
 
-def safe_int(x, default=0) -> int:
-    try:
-        return int(float(x))
-    except Exception:
-        return default
 
-# =======================
-# Subgraph whale scanner
-# =======================
-seen_trade_ids = set()
+def trade_key(t: Dict[str, Any]) -> Tuple[Any, ...]:
+    # Поля могут различаться; делаем устойчивый ключ.
+    return (
+        t.get("transactionHash"),
+        t.get("tradeId"),
+        t.get("timestamp"),
+        t.get("price"),
+        t.get("size"),
+        t.get("outcome"),
+        t.get("side"),
+        t.get("slug"),
+    )
 
-def graphql(query: str) -> dict:
-    r = requests.post(SUBGRAPH_URL, json={"query": query}, timeout=25)
-    r.raise_for_status()
-    data = r.json()
-    if "errors" in data:
-        raise RuntimeError(data["errors"])
-    return data.get("data", {})
 
-def fetch_recent_trades(limit: int = 250):
-    query = f"""
-    {{
-      trades(first: {limit}, orderBy: timestamp, orderDirection: desc) {{
-        id
-        trader
-        collateralAmountUSD
-        price
-        timestamp
-        market {{ question }}
-      }}
-    }}
-    """
-    return graphql(query).get("trades", [])
+def format_signal(t: Dict[str, Any]) -> str:
+    price = to_float(t.get("price"))
+    size = to_float(t.get("size"))
+    notional = price * size  # приближенно, но работает стабильно
 
-def run_subgraph_loop():
-    tg_send(f"Scanner started: trades usd>={MIN_USD}, price<{MAX_PRICE}; fast-move price<{PRICE_LIMIT}, move>={MOVE_PCT*100:.1f}%")
-    print("Subgraph loop started", flush=True)
+    title = (t.get("title") or "").strip()
+    outcome = (t.get("outcome") or "").strip()
+    side = (t.get("side") or "").strip()
+    slug = (t.get("slug") or "").strip()
+
+    tags = []
+    if price > 0 and price < CHEAP_PRICE:
+        tags.append("CHEAP")
+    tags.append("BIG")
+
+    link = f"https://polymarket.com/market/{slug}" if slug else "https://polymarket.com/"
+
+    # Очень коротко и по делу
+    return (
+        f"[{','.join(tags)}] {title}\n"
+        f"{outcome} | {side}\n"
+        f"price={price:.4f} size={size:.2f} notional≈${notional:,.0f}\n"
+        f"{link}"
+    )
+
+
+# =========================
+# Main loop
+# =========================
+def main() -> None:
+    tg_send(f"Bot started. MIN_USD={MIN_USD}, CHEAP< {CHEAP_PRICE}, poll={POLL_SECONDS}s")
 
     while True:
         try:
-            trades = fetch_recent_trades(300)
-            trades = list(reversed(trades))  # old->new
+            trades = fetch_trades()
 
+            # чтобы сообщения шли по времени (старые -> новые)
+            trades = list(reversed(trades))
+
+            sent_count = 0
             for t in trades:
-                tid = t.get("id")
-                if not tid or tid in seen_trade_ids:
+                k = trade_key(t)
+                if k in seen:
                     continue
 
-                usd = safe_float(t.get("collateralAmountUSD"))
-                price = safe_float(t.get("price"))
-                ts = safe_int(t.get("timestamp"))
-                trader = t.get("trader", "unknown")
-                q = (t.get("market") or {}).get("question", "unknown market")
+                price = to_float(t.get("price"))
+                size = to_float(t.get("size"))
+                notional = price * size
 
-                if usd >= MIN_USD and (0 < price < MAX_PRICE):
-                    msg = (
-                        "WHALE TRADE\n"
-                        f"time:  {iso(ts)}\n"
-                        f"usd:   ${usd:,.0f}\n"
-                        f"price: {price}\n"
-                        f"market: {q}\n"
-                        f"trader: {trader}\n"
-                    )
-                    tg_send(msg)
-                    print("Sent whale:", tid, flush=True)
+                # финальная страховка
+                if notional >= MIN_USD and price > 0:
+                    tg_send(format_signal(t))
+                    sent_count += 1
 
-                seen_trade_ids.add(tid)
+                seen.add(k)
 
-            if len(seen_trade_ids) > 20000:
-                seen_trade_ids.clear()
+            print(f"Tick: fetched={len(trades)} sent={sent_count} seen={len(seen)}", flush=True)
+
+            # ограничим память
+            if len(seen) > 8000:
+                # сброс без сложностей — норм для realtime
+                seen.clear()
 
         except Exception as e:
-            print("Subgraph error:", repr(e), flush=True)
+            print("ERROR", repr(e), flush=True)
+            # один короткий алерт, чтобы ты видел, что бот жив, но API глючит
+            try:
+                tg_send(f"Scanner error: {repr(e)[:900]}")
+            except Exception:
+                pass
 
-        time.sleep(SUBGRAPH_POLL_SEC)
+        time.sleep(POLL_SECONDS)
 
-# =======================
-# WebSocket fast-move scanner
-# =======================
-# We store last mid price per market + timestamp
-last_mid = {}  # market_id -> (mid, ts)
 
-def extract_book_like(payload: dict):
-    """
-    Try to extract:
-      - market identifier
-      - bids/asks arrays or best bid/ask directly
-
-    Because schemas vary, we attempt multiple common patterns.
-    Return (market, best_bid, best_ask) or (None, None, None).
-    """
-    market = payload.get("market") or payload.get("market_id") or payload.get("asset_id") or payload.get("token_id")
-
-    # Pattern A: payload has bids/asks arrays of dicts {price, size}
-    bids = payload.get("bids")
-    asks = payload.get("asks")
-
-    def best_price(side):
-        if not isinstance(side, list) or not side:
-            return None
-        # elements might be dicts or [price, size]
-        first = side[0]
-        if isinstance(first, dict):
-            return safe_float(first.get("price"), None)
-        if isinstance(first, (list, tuple)) and len(first) >= 1:
-            return safe_float(first[0], None)
-        return None
-
-    best_bid = best_price(bids) if bids is not None else None
-    best_ask = best_price(asks) if asks is not None else None
-
-    # Pattern B: payload has bestBid/bestAsk or bid/ask
-    if best_bid is None:
-        for k in ("bestBid", "best_bid", "bid"):
-            if k in payload:
-                best_bid = safe_float(payload.get(k), None)
-                break
-    if best_ask is None:
-        for k in ("bestAsk", "best_ask", "ask"):
-            if k in payload:
-                best_ask = safe_float(payload.get(k), None)
-                break
-
-    if market is None or best_bid is None or best_ask is None:
-        return None, None, None
-    return str(market), best_bid, best_ask
-
-def on_ws_message(ws, message):
-    try:
-        data = json.loads(message)
-    except Exception:
-        return
-
-    # Some WS send wrapper objects; try unwrap common patterns
-    payload = data.get("data") if isinstance(data, dict) and "data" in data else data
-
-    # Optional: keep one-line debug of unknown messages (rate-limited)
-    # print("WS msg keys:", list(payload.keys())[:10], flush=True)
-
-    market, best_bid, best_ask = extract_book_like(payload)
-    if not market:
-        return
-
-    mid = (best_bid + best_ask) / 2.0
-    now = int(time.time())
-
-    prev = last_mid.get(market)
-    last_mid[market] = (mid, now)
-
-    if not prev:
-        return
-
-    prev_mid, prev_ts = prev
-    if prev_mid <= 0:
-        return
-
-    # approximate window: only compare if last update was recent
-    if now - prev_ts > MOVE_WINDOW_SEC:
-        return
-
-    move = (mid - prev_mid) / prev_mid
-
-    # Only alert when in "cheap zone"
-    if mid < PRICE_LIMIT and move >= MOVE_PCT:
-        msg = (
-            "FAST MOVE\n"
-            f"market_id: {market}\n"
-            f"mid: {mid:.4f}\n"
-            f"move: +{move*100:.2f}% in ~{now-prev_ts}s\n"
-            f"hint: possible large buy"
-        )
-        tg_send(msg)
-        print("Sent fast-move:", market, flush=True)
-
-def on_ws_open(ws):
-    print("WebSocket connected", flush=True)
-    # Subscription message depends on Polymarket WS schema.
-    # We try a common generic subscribe pattern; if it doesn't work, logs will show server responses.
-    try:
-        ws.send(json.dumps({"type": "subscribe", "channel": "book"}))
-    except Exception:
-        pass
-
-def on_ws_error(ws, error):
-    print("WebSocket error:", repr(error), flush=True)
-
-def on_ws_close(ws, code, reason):
-    print("WebSocket closed:", code, reason, flush=True)
-
-def run_ws_loop():
-    while True:
-        try:
-            ws = websocket.WebSocketApp(
-                WS_URL,
-                on_open=on_ws_open,
-                on_message=on_ws_message,
-                on_error=on_ws_error,
-                on_close=on_ws_close,
-            )
-            ws.run_forever(ping_interval=20, ping_timeout=10)
-        except Exception as e:
-            print("WS loop error:", repr(e), flush=True)
-
-        time.sleep(3)  # reconnect backoff
-
-# =======================
-# Main
-# =======================
 if __name__ == "__main__":
-    print("Starting combined scanner...", flush=True)
-
-    t1 = threading.Thread(target=run_subgraph_loop, daemon=True)
-    t2 = threading.Thread(target=run_ws_loop, daemon=True)
-    t1.start()
-    t2.start()
-
-    # keep process alive
-    while True:
-        time.sleep(60)
+    main()
