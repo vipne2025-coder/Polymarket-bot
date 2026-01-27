@@ -4,6 +4,7 @@ import json
 import sqlite3
 import requests
 from typing import Any, Dict, List, Optional, Tuple
+from collections import defaultdict
 
 # =========================
 # Telegram
@@ -46,51 +47,52 @@ def request_json(url: str, params: dict, retries: int = 3) -> Any:
             time.sleep(2 * (i + 1))
     raise RuntimeError(last_err or "unknown error")
 
-def fetch_trades(filter_min_usd: float, limit: int) -> List[Dict[str, Any]]:
+def fetch_trades(min_usd: float, limit: int) -> List[Dict[str, Any]]:
     params = {"limit": limit}
-    if filter_min_usd > 0:
-        params.update({"filterType": "CASH", "filterAmount": filter_min_usd})
+    # фильтруем по WATCH_MIN_USD на стороне API (меньше мусора)
+    if min_usd > 0:
+        params.update({"filterType": "CASH", "filterAmount": min_usd})
     data = request_json(DATA_API_TRADES, params=params, retries=3)
     if not isinstance(data, list):
         raise RuntimeError(f"Unexpected /trades response type: {type(data)}")
     return data
 
 # =========================
-# Config (Railway Variables)
+# Config (balanced, not too strict)
 # =========================
-MIN_USD = float(os.environ.get("MIN_CASH_USD", "3000"))
+# 2 уровня сигналов
+INSIDER_MIN_USD = float(os.environ.get("INSIDER_MIN_USD", "3000"))
+WATCH_MIN_USD = float(os.environ.get("WATCH_MIN_USD", "1000"))
 
-# твой фильтр по цене сделки
+# фильтр по цене сделки
 MAX_ENTRY_PRICE = float(os.environ.get("MAX_ENTRY_PRICE", "0.40"))
+MIN_PRICE = float(os.environ.get("MIN_PRICE", "0.05"))  # режем копеечный арбитраж
 
-# метки
+# пометки
 EARLY_PRICE = float(os.environ.get("EARLY_PRICE", "0.20"))
 CHEAP_PRICE = float(os.environ.get("MAX_CHEAP_PRICE", "0.15"))
-
-# анти-вилочники: режем совсем “копейки”
-MIN_PRICE = float(os.environ.get("MIN_PRICE", "0.05"))
 
 # скорость/свежесть
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "12"))
 TRADES_LIMIT = int(os.environ.get("TRADES_LIMIT", "140"))
-MAX_TRADE_AGE_SEC = int(os.environ.get("MAX_TRADE_AGE_SEC", "300"))
+MAX_TRADE_AGE_SEC = int(os.environ.get("MAX_TRADE_AGE_SEC", "600"))  # 10 минут — чтобы сигналы были
 
-# меньше спама
-MARKET_COOLDOWN_SEC = int(os.environ.get("MARKET_COOLDOWN_SEC", "240"))
-WALLET_COOLDOWN_SEC = int(os.environ.get("WALLET_COOLDOWN_SEC", "180"))
+# анти-спам
+MARKET_COOLDOWN_SEC = int(os.environ.get("MARKET_COOLDOWN_SEC", "180"))  # 3 минуты
+WALLET_COOLDOWN_SEC = int(os.environ.get("WALLET_COOLDOWN_SEC", "120"))  # 2 минуты
 
-# анти-арб/анти-бот
-FLIP_WINDOW_SEC = int(os.environ.get("FLIP_WINDOW_SEC", "1800"))
-MARKET_WINDOW_SEC = int(os.environ.get("MARKET_WINDOW_SEC", "900"))
-MAX_TRADES_PER_MARKET_WINDOW = int(os.environ.get("MAX_TRADES_PER_MARKET_WINDOW", "6"))
-BLACKLIST_TTL_SEC = int(os.environ.get("BLACKLIST_TTL_SEC", "86400"))
+# анти-вилочник (работает только когда wallet есть)
+FLIP_WINDOW_SEC = int(os.environ.get("FLIP_WINDOW_SEC", "1800"))         # 30 минут
+MARKET_WINDOW_SEC = int(os.environ.get("MARKET_WINDOW_SEC", "900"))      # 15 минут
+MAX_TRADES_PER_MARKET_WINDOW = int(os.environ.get("MAX_TRADES_PER_MARKET_WINDOW", "8"))
+BLACKLIST_TTL_SEC = int(os.environ.get("BLACKLIST_TTL_SEC", "43200"))    # 12 часов (не сутки)
 
-# режим отправки
-SEND_WATCH = int(os.environ.get("SEND_WATCH", "1"))  # 0=только STRONG, 1=+WATCH
+# ВАЖНО: разрешаем сигналы без wallet (иначе часто "тишина")
+ALLOW_NO_WALLET = int(os.environ.get("ALLOW_NO_WALLET", "1"))  # 1 = да
 
-# анти-FOMO подтверждение
-CONFIRM_DELAY_SEC = int(os.environ.get("CONFIRM_DELAY_SEC", "25"))
-MAX_PRICE_SLIPPAGE_PCT = float(os.environ.get("MAX_PRICE_SLIPPAGE_PCT", "0.15"))  # 15%
+# Отладка: печатать статистику отсева в логах
+DEBUG_STATS = int(os.environ.get("DEBUG_STATS", "1"))
+DEBUG_EVERY_SEC = int(os.environ.get("DEBUG_EVERY_SEC", "120"))
 
 DB_PATH = os.environ.get("DB_PATH", "scanner.db")
 
@@ -112,6 +114,18 @@ def to_int(x: Any) -> int:
     except Exception:
         return 0
 
+def extract_wallet(t: Dict[str, Any]) -> str:
+    for k in ("maker", "taker", "trader", "user", "wallet", "address"):
+        v = t.get(k)
+        if isinstance(v, str) and v:
+            return v
+    return ""
+
+def short_addr(addr: str) -> str:
+    if not addr or len(addr) < 12:
+        return "n/a"
+    return f"{addr[:6]}...{addr[-4:]}"
+
 def side_to_yes_no(side: str) -> str:
     s = (side or "").upper()
     if s == "BUY":
@@ -120,19 +134,11 @@ def side_to_yes_no(side: str) -> str:
         return "NO"
     return s or "?"
 
-def short_addr(addr: str) -> str:
-    if not addr or len(addr) < 12:
-        return "n/a"
-    return f"{addr[:6]}...{addr[-4:]}"
-
-def extract_wallet(t: Dict[str, Any]) -> str:
-    for k in ("maker", "taker", "trader", "user", "wallet", "address"):
-        v = t.get(k)
-        if isinstance(v, str) and v:
-            return v
-    return ""
+def market_link(slug: str) -> str:
+    return f"https://polymarket.com/market/{slug}" if slug else "https://polymarket.com"
 
 def trade_key(t: Dict[str, Any]) -> str:
+    # строковый ключ для SQLite
     parts = {
         "tx": t.get("transactionHash"),
         "id": t.get("tradeId"),
@@ -144,9 +150,6 @@ def trade_key(t: Dict[str, Any]) -> str:
         "slug": t.get("slug"),
     }
     return json.dumps(parts, sort_keys=True, ensure_ascii=False)
-
-def market_link(slug: str) -> str:
-    return f"https://polymarket.com/market/{slug}" if slug else "https://polymarket.com"
 
 # =========================
 # SQLite
@@ -160,16 +163,7 @@ def init_db() -> None:
     conn = db()
     cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS seen_trades (k TEXT PRIMARY KEY, ts INTEGER)")
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS wallet_stats (
-        wallet TEXT PRIMARY KEY,
-        total INTEGER DEFAULT 0,
-        big INTEGER DEFAULT 0,
-        early INTEGER DEFAULT 0,
-        flips INTEGER DEFAULT 0,
-        updated_ts INTEGER DEFAULT 0
-      )
-    """)
+    cur.execute("CREATE TABLE IF NOT EXISTS last_alert (key TEXT PRIMARY KEY, ts INTEGER)")
     cur.execute("""
       CREATE TABLE IF NOT EXISTS wallet_blacklist (
         wallet TEXT PRIMARY KEY,
@@ -183,22 +177,6 @@ def init_db() -> None:
       )
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_wma ON wallet_market_actions(wallet, slug, ts)")
-    cur.execute("CREATE TABLE IF NOT EXISTS last_alert (key TEXT PRIMARY KEY, ts INTEGER)")
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS pending_confirm (
-        trade_k TEXT PRIMARY KEY,
-        slug TEXT,
-        wallet TEXT,
-        side TEXT,
-        outcome TEXT,
-        title TEXT,
-        first_price REAL,
-        first_notional REAL,
-        first_size REAL,
-        created_ts INTEGER,
-        confirm_after_ts INTEGER
-      )
-    """)
     conn.commit()
     conn.close()
 
@@ -257,48 +235,6 @@ def is_blacklisted(wallet: str) -> Tuple[bool, str]:
         return False, ""
     return True, reason
 
-def bump_wallet_stats(wallet: str, notional: float, price: float) -> None:
-    ts = now_ts()
-    big = 1 if notional >= 10000 else 0
-    early = 1 if 0 < price < EARLY_PRICE else 0
-    conn = db()
-    conn.execute("""
-      INSERT INTO wallet_stats(wallet, total, big, early, flips, updated_ts)
-      VALUES(?, 1, ?, ?, 0, ?)
-      ON CONFLICT(wallet) DO UPDATE SET
-        total = total + 1,
-        big = big + ?,
-        early = early + ?,
-        updated_ts = ?
-    """, (wallet, big, early, ts, big, early, ts))
-    conn.commit()
-    conn.close()
-
-def bump_flip(wallet: str) -> None:
-    ts = now_ts()
-    conn = db()
-    conn.execute("""
-      INSERT INTO wallet_stats(wallet, total, big, early, flips, updated_ts)
-      VALUES(?, 0, 0, 0, 1, ?)
-      ON CONFLICT(wallet) DO UPDATE SET
-        flips = flips + 1,
-        updated_ts = ?
-    """, (wallet, ts, ts))
-    conn.commit()
-    conn.close()
-
-def wallet_score(wallet: str) -> int:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT total, big, early, flips FROM wallet_stats WHERE wallet=?", (wallet,))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return 0
-    total, big, early, flips = map(int, row)
-    # скоринг: опыт + ранние + большие, flips сильно штрафуют
-    return min(total, 40) + (big * 4) + (early * 6) - (flips * 10)
-
 def record_action(wallet: str, slug: str, side: str, ts: int) -> None:
     conn = db()
     conn.execute(
@@ -337,43 +273,9 @@ def detect_flip_and_frequency(wallet: str, slug: str, side: str, ts: int) -> Tup
         return True, f"too frequent in market ({cnt}/{MARKET_WINDOW_SEC}s)"
     return False, ""
 
-def enqueue_confirm(trade_k: str, slug: str, wallet: str, side: str, outcome: str, title: str,
-                    first_price: float, first_notional: float, first_size: float, created_ts: int) -> None:
-    conn = db()
-    conn.execute("""
-      INSERT OR REPLACE INTO pending_confirm
-      (trade_k, slug, wallet, side, outcome, title, first_price, first_notional, first_size, created_ts, confirm_after_ts)
-      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (trade_k, slug, wallet, side, outcome, title, first_price, first_notional, first_size, created_ts,
-          created_ts + CONFIRM_DELAY_SEC))
-    conn.commit()
-    conn.close()
-
-def pop_due_confirms(ts: int) -> List[Dict[str, Any]]:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-      SELECT trade_k, slug, wallet, side, outcome, title, first_price, first_notional, first_size, created_ts, confirm_after_ts
-      FROM pending_confirm
-      WHERE confirm_after_ts <= ?
-      ORDER BY confirm_after_ts ASC
-      LIMIT 50
-    """, (ts,))
-    rows = cur.fetchall()
-    cur.execute("DELETE FROM pending_confirm WHERE confirm_after_ts <= ?", (ts,))
-    conn.commit()
-    conn.close()
-
-    out = []
-    for r in rows:
-        out.append({
-            "trade_k": r[0], "slug": r[1], "wallet": r[2], "side": r[3],
-            "outcome": r[4], "title": r[5],
-            "first_price": float(r[6]), "first_notional": float(r[7]), "first_size": float(r[8]),
-            "created_ts": int(r[9]), "confirm_after_ts": int(r[10]),
-        })
-    return out
-
+# =========================
+# Cooldowns
+# =========================
 def should_alert_by_cooldown(slug: str, wallet: str, ts: int) -> bool:
     if slug and ts - get_last_alert(f"m:{slug}") < MARKET_COOLDOWN_SEC:
         return False
@@ -388,137 +290,87 @@ def set_cooldown(slug: str, wallet: str, ts: int) -> None:
         set_last_alert(f"w:{wallet}", ts)
 
 # =========================
-# Signal classification + formatting
+# Two-level classifier
 # =========================
-def classify(price: float, notional: float, score: int, wallet_present: bool) -> str:
-    # без кошелька — супер строго
-    if not wallet_present:
-        if notional >= 20000 and price < EARLY_PRICE:
+def classify(price: float, notional: float, wallet_present: bool) -> str:
+    # базовые правила: INSIDER/WATCH
+    if notional >= INSIDER_MIN_USD:
+        # если кошелька нет — всё равно разрешаем INSIDER (иначе будет тишина),
+        # но требуем более “раннюю/адекватную” цену, чтобы не ловить мусор.
+        if (not wallet_present) and (not ALLOW_NO_WALLET):
+            return "DROP"
+        if (not wallet_present) and price > 0.30:
             return "WATCH"
-        return "DROP"
+        return "INSIDER"
 
-    # STRONG (максимально безопасно)
-    if price < EARLY_PRICE and notional >= 7000 and score >= 12:
-        return "STRONG"
-    if price < CHEAP_PRICE and notional >= 10000 and score >= 8:
-        return "STRONG"
-
-    # WATCH (опционально)
-    if price <= 0.30 and notional >= MIN_USD and score >= 8:
+    if notional >= WATCH_MIN_USD:
+        if (not wallet_present) and (not ALLOW_NO_WALLET):
+            return "DROP"
         return "WATCH"
 
     return "DROP"
 
-def tags_line(price: float, notional: float, score: int) -> str:
-    tags = []
-    if price < EARLY_PRICE:
-        tags.append("EARLY")
-    if price < CHEAP_PRICE:
-        tags.append("CHEAP")
-    tags.append("WHALE" if notional >= 10000 else "BIG")
-    if score >= 25:
-        tags.append("TRUST+")
-    elif score >= 12:
-        tags.append("TRUST")
-    else:
-        tags.append("NEW")
-    return " + ".join(tags)
+def format_msg(level: str, t: Dict[str, Any], price: float, size: float, notional: float, wallet: str) -> str:
+    title = (t.get("title") or "Unknown market").strip()
+    outcome = (t.get("outcome") or "Unknown outcome").strip()
+    side = (t.get("side") or "").upper()
+    slug = (t.get("slug") or "").strip()
 
-def format_signal(level: str, title: str, outcome: str, side: str,
-                  price: float, size: float, notional: float,
-                  wallet: str, score: int, slug: str,
-                  note: str = "") -> str:
-    lvl_emoji = "🟢" if level == "STRONG" else "🟡"
+    early_tag = " ⚡EARLY" if 0 < price < EARLY_PRICE else ""
+    cheap_tag = " 💎CHEAP" if 0 < price < CHEAP_PRICE else ""
+
+    header = "🔥 INSIDER" if level == "INSIDER" else "👀 WATCH"
+
     msg = (
-        f"{lvl_emoji} {level} SIGNAL — {tags_line(price, notional, score)}\n\n"
+        f"{header} SIGNAL{early_tag}{cheap_tag}\n\n"
         f"📊 {title}\n"
         f"📌 СТАВКА: {outcome} — {side_to_yes_no(side)}\n\n"
-        f"💵 Цена входа: ${price:.3f}\n"
+        f"💵 Цена: ${price:.3f}\n"
         f"📦 Акции: {size:,.0f}\n"
-        f"💰 Сумма: ~${notional:,.0f}\n\n"
+        f"💰 Сумма: ~${notional:,.0f}\n"
+        f"👛 Wallet: {short_addr(wallet)}\n\n"
+        f"🔗 {market_link(slug)}"
     )
-    if wallet:
-        msg += f"👛 Wallet: {short_addr(wallet)} | score={score}\n"
-        if wallet.startswith("0x"):
-            msg += f"https://polygonscan.com/address/{wallet}\n\n"
-        else:
-            msg += "\n"
-    else:
-        msg += "👛 Wallet: n/a\n\n"
-
-    if note:
-        msg += f"⚠️ {note}\n\n"
-
-    msg += f"🔗 {market_link(slug)}"
+    if wallet and wallet.startswith("0x"):
+        msg = msg.replace("👛 Wallet:", f"👛 Wallet: {short_addr(wallet)}\nhttps://polygonscan.com/address/{wallet}\n")
+        # аккуратно: чтобы не было дубля "wallet"
+        msg = msg.replace(f"👛 Wallet: {short_addr(wallet)}\nhttps://polygonscan.com/address/{wallet}\n{short_addr(wallet)}", f"👛 Wallet: {short_addr(wallet)}\nhttps://polygonscan.com/address/{wallet}")
     return msg
-
-def latest_price_for_slug(slug: str) -> Optional[float]:
-    # пере-проверка цены через свежие трейды (быстро и без других API)
-    trades = fetch_trades(0.0, limit=80)
-    for t in trades:
-        if (t.get("slug") or "").strip() == slug:
-            p = to_float(t.get("price"))
-            if p > 0:
-                return p
-    return None
 
 # =========================
 # Main
 # =========================
 def main() -> None:
     init_db()
+
     tg_send(
-        "✅ SAFE PRO scanner started\n"
-        f"Filters: notional≥{MIN_USD}, price∈[{MIN_PRICE},{MAX_ENTRY_PRICE}], age≤{MAX_TRADE_AGE_SEC}s\n"
-        f"EARLY<{EARLY_PRICE}, CHEAP<{CHEAP_PRICE}, poll={POLL_SECONDS}s\n"
-        f"Confirm={CONFIRM_DELAY_SEC}s, SEND_WATCH={SEND_WATCH}"
+        "✅ Scanner started (balanced)\n"
+        f"INSIDER≥${INSIDER_MIN_USD}, WATCH≥${WATCH_MIN_USD}\n"
+        f"price∈[{MIN_PRICE},{MAX_ENTRY_PRICE}], age≤{MAX_TRADE_AGE_SEC}s\n"
+        f"ALLOW_NO_WALLET={ALLOW_NO_WALLET}"
     )
-    print("Started", flush=True)
+
+    last_debug = 0
+    counters = defaultdict(int)
 
     while True:
         try:
-            # 1) Confirm queue (anti-FOMO)
-            due = pop_due_confirms(now_ts())
-            for item in due:
-                slug = item["slug"]
-                first_price = item["first_price"]
+            now = now_ts()
+            trades = fetch_trades(WATCH_MIN_USD, limit=TRADES_LIMIT)
+            trades = list(reversed(trades))
 
-                note = ""
-                current_price = latest_price_for_slug(slug)
-                if current_price and first_price > 0:
-                    move = (current_price - first_price) / first_price
-                    if move > MAX_PRICE_SLIPPAGE_PCT:
-                        note = f"Цена уже выше примерно на +{move*100:.0f}% — вход может быть поздним"
+            sent = 0
 
-                wallet = item["wallet"]
-                score = wallet_score(wallet) if wallet else 0
-
-                tg_send(format_signal(
-                    level="STRONG",
-                    title=item["title"],
-                    outcome=item["outcome"],
-                    side=item["side"],
-                    price=first_price,
-                    size=item["first_size"],
-                    notional=item["first_notional"],
-                    wallet=wallet,
-                    score=score,
-                    slug=item["slug"],
-                    note=note
-                ))
-
-            # 2) New trades
-            trades = fetch_trades(MIN_USD, limit=TRADES_LIMIT)
-            trades = list(reversed(trades))  # old->new
-
-            queued = 0
             for t in trades:
                 k = trade_key(t)
                 if seen_trade(k):
+                    counters["skip_seen"] += 1
                     continue
 
-                ts = to_int(t.get("timestamp")) or now_ts()
-                if now_ts() - ts > MAX_TRADE_AGE_SEC:
+                ts = to_int(t.get("timestamp")) or now
+                age = now - ts
+                if age > MAX_TRADE_AGE_SEC:
+                    counters["skip_age"] += 1
                     mark_seen_trade(k, ts)
                     continue
 
@@ -526,77 +378,80 @@ def main() -> None:
                 size = to_float(t.get("size"))
                 notional = price * size
 
-                slug = (t.get("slug") or "").strip()
-                title = (t.get("title") or "Unknown market").strip()
-                outcome = (t.get("outcome") or "Unknown outcome").strip()
-                side = (t.get("side") or "").upper()
-
-                # hard filters
-                if notional < MIN_USD:
-                    mark_seen_trade(k, ts); continue
                 if not (MIN_PRICE <= price <= MAX_ENTRY_PRICE):
-                    mark_seen_trade(k, ts); continue
+                    counters["skip_price"] += 1
+                    mark_seen_trade(k, ts)
+                    continue
+
+                if notional < WATCH_MIN_USD:
+                    counters["skip_small"] += 1
+                    mark_seen_trade(k, ts)
+                    continue
+
+                slug = (t.get("slug") or "").strip()
                 if not slug:
-                    # ради безопасности: без ссылки на рынок чаще мусор
-                    mark_seen_trade(k, ts); continue
+                    counters["skip_no_slug"] += 1
+                    mark_seen_trade(k, ts)
+                    continue
 
                 wallet = extract_wallet(t)
                 wallet_present = bool(wallet)
 
-                # blacklist
+                # если wallet нет и запрещено — режем
+                if (not wallet_present) and (not ALLOW_NO_WALLET):
+                    counters["skip_no_wallet"] += 1
+                    mark_seen_trade(k, ts)
+                    continue
+
+                # blacklist / anti-viloch (только если wallet есть)
                 if wallet_present:
                     bl, _ = is_blacklisted(wallet)
                     if bl:
-                        mark_seen_trade(k, ts); continue
+                        counters["skip_blacklist"] += 1
+                        mark_seen_trade(k, ts)
+                        continue
 
-                # anti-arb
-                if wallet_present and side in ("BUY", "SELL"):
-                    record_action(wallet, slug, side, ts)
-                    bad, reason = detect_flip_and_frequency(wallet, slug, side, ts)
-                    if bad:
-                        bump_flip(wallet)
-                        blacklist_wallet(wallet, reason)
-                        mark_seen_trade(k, ts); continue
+                    side = (t.get("side") or "").upper()
+                    if side in ("BUY", "SELL"):
+                        record_action(wallet, slug, side, ts)
+                        bad, reason = detect_flip_and_frequency(wallet, slug, side, ts)
+                        if bad:
+                            blacklist_wallet(wallet, reason)
+                            counters["skip_viloch"] += 1
+                            mark_seen_trade(k, ts)
+                            continue
 
-                # scoring
-                score = 0
-                if wallet_present:
-                    bump_wallet_stats(wallet, notional, price)
-                    score = wallet_score(wallet)
-
-                level = classify(price, notional, score, wallet_present)
-                if level == "DROP":
-                    mark_seen_trade(k, ts); continue
-                if level == "WATCH" and not SEND_WATCH:
-                    mark_seen_trade(k, ts); continue
-
-                # cooldown
+                # cooldown (для уменьшения шума)
                 if not should_alert_by_cooldown(slug, wallet, ts):
-                    mark_seen_trade(k, ts); continue
+                    counters["skip_cooldown"] += 1
+                    mark_seen_trade(k, ts)
+                    continue
 
-                # STRONG -> confirm flow (safe), WATCH -> direct
-                if level == "STRONG":
-                    enqueue_confirm(
-                        trade_k=k, slug=slug, wallet=wallet, side=side,
-                        outcome=outcome, title=title,
-                        first_price=price, first_notional=notional, first_size=size,
-                        created_ts=ts
-                    )
-                    queued += 1
-                else:
-                    tg_send(format_signal(
-                        level=level, title=title, outcome=outcome, side=side,
-                        price=price, size=size, notional=notional,
-                        wallet=wallet, score=score, slug=slug
-                    ))
+                level = classify(price, notional, wallet_present)
+                if level == "DROP":
+                    counters["skip_class"] += 1
+                    mark_seen_trade(k, ts)
+                    continue
 
+                tg_send(format_msg(level, t, price, size, notional, wallet))
                 set_cooldown(slug, wallet, ts)
+                sent += 1
+                counters["sent"] += 1
+
                 mark_seen_trade(k, ts)
 
-            print(f"Tick: fetched={len(trades)} queued={queued}", flush=True)
+            print(f"Tick: fetched={len(trades)} sent={sent}", flush=True)
+
+            # debug summary раз в DEBUG_EVERY_SEC
+            if DEBUG_STATS and (now - last_debug >= DEBUG_EVERY_SEC):
+                last_debug = now
+                summary = " | ".join(f"{k}={v}" for k, v in sorted(counters.items()))
+                print("DEBUG:", summary, flush=True)
+                # сбрасываем, чтобы видеть динамику
+                counters.clear()
 
         except Exception as e:
-            print("ERROR", repr(e), flush=True)
+            print("ERROR:", repr(e), flush=True)
             try:
                 tg_send(f"⚠️ Scanner error: {repr(e)[:900]}")
             except Exception:
@@ -606,5 +461,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
