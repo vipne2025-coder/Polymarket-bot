@@ -73,11 +73,11 @@ MIN_PRICE = float(os.environ.get("MIN_PRICE", "0.05"))
 # скорость/свежесть
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "12"))
 TRADES_LIMIT = int(os.environ.get("TRADES_LIMIT", "140"))
-MAX_TRADE_AGE_SEC = int(os.environ.get("MAX_TRADE_AGE_SEC", "120"))
+MAX_TRADE_AGE_SEC = int(os.environ.get("MAX_TRADE_AGE_SEC", "250"))
 
 # меньше спама
 MARKET_COOLDOWN_SEC = int(os.environ.get("MARKET_COOLDOWN_SEC", "240"))
-WALLET_COOLDOWN_SEC = int(os.environ.get("WALLET_COOLDOWN_SEC", "120"))
+WALLET_COOLDOWN_SEC = int(os.environ.get("WALLET_COOLDOWN_SEC", "180"))
 
 # анти-арб/анти-бот
 FLIP_WINDOW_SEC = int(os.environ.get("FLIP_WINDOW_SEC", "1800"))
@@ -86,7 +86,7 @@ MAX_TRADES_PER_MARKET_WINDOW = int(os.environ.get("MAX_TRADES_PER_MARKET_WINDOW"
 BLACKLIST_TTL_SEC = int(os.environ.get("BLACKLIST_TTL_SEC", "86400"))
 
 # режим отправки
-SEND_WATCH = int(os.environ.get("SEND_WATCH", "0"))  # 0=только STRONG, 1=+WATCH
+SEND_WATCH = int(os.environ.get("SEND_WATCH", "1"))  # 0=только STRONG, 1=+WATCH
 
 # анти-FOMO подтверждение
 CONFIRM_DELAY_SEC = int(os.environ.get("CONFIRM_DELAY_SEC", "25"))
@@ -606,3 +606,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
