@@ -4,7 +4,7 @@ import requests
 from typing import Any, Dict, List, Optional, Tuple
 
 # =========================
-# Config (через env)
+# Config (env)
 # =========================
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -14,11 +14,12 @@ if not TG_TOKEN or not TG_CHAT_ID:
 
 MIN_USD = float(os.environ.get("MIN_CASH_USD", "3000"))
 
-# Метка CHEAP (как раньше; это НЕ фильтр, а просто тег)
-CHEAP_PRICE = float(os.environ.get("MAX_CHEAP_PRICE", "0.15"))
+# Метки (НЕ фильтр)
+CHEAP_PRICE = float(os.environ.get("MAX_CHEAP_PRICE", "0.15"))      # CHEAP если price < 0.15
+EARLY_PRICE = float(os.environ.get("EARLY_PRICE", "0.20"))          # EARLY если price < 0.20
 
-# НОВОЕ: фильтр по цене сделки (всё дороже — игнорируем)
-MAX_ENTRY_PRICE = float(os.environ.get("MAX_ENTRY_PRICE", "0.40"))
+# Фильтр (главный)
+MAX_ENTRY_PRICE = float(os.environ.get("MAX_ENTRY_PRICE", "0.40"))  # игнорируем сделки дороже
 
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "15"))
 TRADES_LIMIT = int(os.environ.get("TRADES_LIMIT", "100"))
@@ -66,7 +67,7 @@ def request_json(url: str, params: dict, retries: int = 3) -> Any:
     raise RuntimeError(last_err or "unknown error")
 
 def fetch_trades() -> List[Dict[str, Any]]:
-    # API-фильтр по денежной сумме сделки (но мы всё равно пересчитываем notional)
+    # API-фильтр по notional, но всё равно пересчитываем сами
     params = {
         "limit": TRADES_LIMIT,
         "filterType": "CASH",
@@ -84,7 +85,6 @@ def to_float(x: Any) -> float:
         return 0.0
 
 def trade_key(t: Dict[str, Any]) -> Tuple[Any, ...]:
-    # Устойчивый ключ (поля могут быть пустыми/разными)
     return (
         t.get("transactionHash"),
         t.get("tradeId"),
@@ -96,23 +96,51 @@ def trade_key(t: Dict[str, Any]) -> Tuple[Any, ...]:
         t.get("slug"),
     )
 
+# =========================
+# Message formatting
+# =========================
+def side_to_yes_no(side: str) -> str:
+    s = (side or "").upper()
+    # Для восприятия: BUY = YES, SELL = NO
+    if s == "BUY":
+        return "YES"
+    if s == "SELL":
+        return "NO"
+    return s or "?"
+
+def build_tags(price: float, notional: float) -> str:
+    tags = []
+    if price > 0 and price < CHEAP_PRICE:
+        tags.append("CHEAP")
+    if price > 0 and price < EARLY_PRICE:
+        tags.append("EARLY")
+    if notional >= MIN_USD:
+        tags.append("BIG")
+    return " + ".join(tags) if tags else "SIGNAL"
+
 def format_signal(t: Dict[str, Any], price: float, size: float, notional: float) -> str:
-    title = (t.get("title") or "").strip()
-    outcome = (t.get("outcome") or "").strip()
-    side = (t.get("side") or "").strip()
+    title = (t.get("title") or "Unknown market").strip()
+    outcome = (t.get("outcome") or "Unknown outcome").strip()
+    side = side_to_yes_no(t.get("side") or "")
     slug = (t.get("slug") or "").strip()
 
-    tags = ["BIG"]
-    if 0 < price < CHEAP_PRICE:
-        tags.insert(0, "CHEAP")  # CHEAP,BIG
+    link = f"https://polymarket.com/market/{slug}" if slug else "https://polymarket.com"
 
-    link = f"https://polymarket.com/market/{slug}" if slug else "https://polymarket.com/"
+    # Красивые числа
+    price_s = f"${price:.3f}"
+    shares_s = f"{size:,.0f}"
+    usd_s = f"${notional:,.0f}"
+
+    tag_line = build_tags(price, notional)
 
     return (
-        f"[{','.join(tags)}] {title}\n"
-        f"{outcome} | {side}\n"
-        f"price={price:.4f} size={size:.2f} notional≈${notional:,.0f}\n"
-        f"{link}"
+        f"🐋 {tag_line}\n\n"
+        f"📊 {title}\n"
+        f"📌 СТАВКА: {outcome} — {side}\n\n"
+        f"💵 Цена входа: {price_s}\n"
+        f"📦 Кол-во акций: {shares_s}\n"
+        f"💰 Сумма: ~{usd_s}\n\n"
+        f"🔗 {link}"
     )
 
 # =========================
@@ -120,8 +148,11 @@ def format_signal(t: Dict[str, Any], price: float, size: float, notional: float)
 # =========================
 def main() -> None:
     tg_send(
-        f"Bot started. MIN_USD={MIN_USD}, MAX_ENTRY_PRICE={MAX_ENTRY_PRICE}, "
-        f"CHEAP<{CHEAP_PRICE}, poll={POLL_SECONDS}s"
+        "✅ Bot started\n"
+        f"MIN_USD={MIN_USD}\n"
+        f"MAX_ENTRY_PRICE={MAX_ENTRY_PRICE}\n"
+        f"EARLY<{EARLY_PRICE}, CHEAP<{CHEAP_PRICE}\n"
+        f"poll={POLL_SECONDS}s"
     )
 
     while True:
@@ -137,27 +168,25 @@ def main() -> None:
 
                 price = to_float(t.get("price"))
                 size = to_float(t.get("size"))
-                notional = price * size  # приближённо, но стабильно
+                notional = price * size
 
-                # ФИЛЬТР: сумма + цена сделки <= 0.40
+                # ФИЛЬТР: notional + цена сделки <= 0.40
                 if notional >= MIN_USD and 0 < price <= MAX_ENTRY_PRICE:
                     tg_send(format_signal(t, price, size, notional))
                     sent_count += 1
 
                 seen.add(k)
 
-            print(
-                f"Tick: fetched={len(trades)} sent={sent_count} seen={len(seen)}",
-                flush=True
-            )
+            print(f"Tick: fetched={len(trades)} sent={sent_count} seen={len(seen)}", flush=True)
 
+            # чтобы память не росла бесконечно
             if len(seen) > 8000:
                 seen.clear()
 
         except Exception as e:
             print("ERROR", repr(e), flush=True)
             try:
-                tg_send(f"Scanner error: {repr(e)[:900]}")
+                tg_send(f"⚠️ Scanner error: {repr(e)[:900]}")
             except Exception:
                 pass
 
