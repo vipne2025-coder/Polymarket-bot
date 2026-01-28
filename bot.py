@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 # =========================
-# Telegram (обязательно)
+# Telegram
 # =========================
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -28,18 +28,14 @@ def tg_send(text: str) -> None:
 
 
 # =========================
-# User settings (под тебя)
+# User settings
 # =========================
 EQUITY_USD = float(os.environ.get("EQUITY_USD", "200"))
-LEVERAGE = float(os.environ.get("LEVERAGE", "15"))  # ты хотел 15
+LEVERAGE = float(os.environ.get("LEVERAGE", "15"))
 
-# Рекомендованные объёмы (notional)
-NOTIONAL_FAST = float(os.environ.get("NOTIONAL_FAST", "20"))
+# Рекомендуемый notional по типу
 NOTIONAL_TREND = float(os.environ.get("NOTIONAL_TREND", "20"))
 NOTIONAL_BOOST = float(os.environ.get("NOTIONAL_BOOST", "50"))
-
-# Late-entry: не входить, если цена убежала слишком далеко за время подтверждения
-MAX_ENTRY_SLIPPAGE_PCT = float(os.environ.get("MAX_ENTRY_SLIPPAGE_PCT", "0.006"))  # 0.6%
 
 # =========================
 # Bot settings
@@ -48,57 +44,53 @@ BYBIT_BASE = os.environ.get("BYBIT_BASE", "https://api.bybit.com").rstrip("/")
 POLL_SECONDS = float(os.environ.get("POLL_SECONDS", "10"))
 TOP_N = int(os.environ.get("TOP_N", "20"))
 
-CONFIRM_DELAY_SEC = int(os.environ.get("CONFIRM_DELAY_SEC", "25"))
-SYMBOL_COOLDOWN_SEC = int(os.environ.get("SYMBOL_COOLDOWN_SEC", "600"))  # 10 мин
+CONFIRM_DELAY_SEC = int(os.environ.get("CONFIRM_DELAY_SEC", "20"))
+SYMBOL_COOLDOWN_SEC = int(os.environ.get("SYMBOL_COOLDOWN_SEC", "1200"))  # 20 мин
 
-# Lookbacks (строим из накопленной истории тикеров)
-OI_LOOKBACK_SEC = int(os.environ.get("OI_LOOKBACK_SEC", "300"))         # 5м
-PRICE_LOOKBACK_SEC = int(os.environ.get("PRICE_LOOKBACK_SEC", "120"))   # 2м
+# Lookbacks from tickers history
+OI_LOOKBACK_SEC = int(os.environ.get("OI_LOOKBACK_SEC", "300"))       # ~5m
+PRICE_LOOKBACK_SEC = int(os.environ.get("PRICE_LOOKBACK_SEC", "120")) # ~2m
 
-MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", "0.12"))         # 0.12% спред максимум
+MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", "0.08"))      # 0.08% максимум
 
-# Funding risk flags (не блокируем, но помечаем)
-FUNDING_HIGH = float(os.environ.get("FUNDING_HIGH", "0.0002"))           # ~0.02%
+# Funding risk flags (не блокируем, помечаем)
+FUNDING_HIGH = float(os.environ.get("FUNDING_HIGH", "0.0002"))
 FUNDING_LOW = float(os.environ.get("FUNDING_LOW", "-0.0002"))
 
-# Kline confirm (объём + ATR% для SL/TP)
-USE_KLINE_CONFIRM = int(os.environ.get("USE_KLINE_CONFIRM", "1"))
-KLINE_INTERVAL = os.environ.get("KLINE_INTERVAL", "1")                  # 1m
-KLINE_LIMIT = int(os.environ.get("KLINE_LIMIT", "60"))                  # 60 минут
-VOL_SPIKE_MULT = float(os.environ.get("VOL_SPIKE_MULT", "1.6"))          # всплеск объёма
+# Kline
+USE_KLINE = int(os.environ.get("USE_KLINE", "1"))
+KLINE_INTERVAL = os.environ.get("KLINE_INTERVAL", "1")   # 1m
+KLINE_LIMIT = int(os.environ.get("KLINE_LIMIT", "120"))   # 120 минут истории
+VOL_SPIKE_MULT = float(os.environ.get("VOL_SPIKE_MULT", "1.8"))
 
-# =========================
-# Классы сигналов (FAST / TREND / BOOST)
-# Пороги можно менять env'ом, но дефолты рабочие.
-# =========================
-FAST_PRICE_MOVE_PCT = float(os.environ.get("FAST_PRICE_MOVE_PCT", "0.70"))    # ΔPrice% за ~2м
-FAST_OI_CHANGE_PCT = float(os.environ.get("FAST_OI_CHANGE_PCT", "1.20"))      # ΔOI% за ~5м
+# Сигналы (FAST отключён — специально)
+TREND_PRICE_MOVE_PCT = float(os.environ.get("TREND_PRICE_MOVE_PCT", "1.2"))
+TREND_OI_CHANGE_PCT = float(os.environ.get("TREND_OI_CHANGE_PCT", "2.0"))
 
-TREND_PRICE_MOVE_PCT = float(os.environ.get("TREND_PRICE_MOVE_PCT", "1.00"))
-TREND_OI_CHANGE_PCT = float(os.environ.get("TREND_OI_CHANGE_PCT", "1.80"))
+BOOST_PRICE_MOVE_PCT = float(os.environ.get("BOOST_PRICE_MOVE_PCT", "1.8"))
+BOOST_OI_CHANGE_PCT = float(os.environ.get("BOOST_OI_CHANGE_PCT", "3.0"))
 
-BOOST_PRICE_MOVE_PCT = float(os.environ.get("BOOST_PRICE_MOVE_PCT", "1.20"))
-BOOST_OI_CHANGE_PCT = float(os.environ.get("BOOST_OI_CHANGE_PCT", "2.50"))
+# Вход по откату (зона)
+# LONG: вход ниже текущей цены на 0.3–0.7%
+# SHORT: вход выше текущей цены на 0.3–0.7%
+PULLBACK_MIN_PCT = float(os.environ.get("PULLBACK_MIN_PCT", "0.30"))
+PULLBACK_MAX_PCT = float(os.environ.get("PULLBACK_MAX_PCT", "0.70"))
 
-# SL/TP в % (именно проценты от цены, не плечо)
-FAST_SL_PCT = float(os.environ.get("FAST_SL_PCT", "0.70"))
-FAST_TP1_PCT = float(os.environ.get("FAST_TP1_PCT", "1.20"))
-FAST_TP2_PCT = float(os.environ.get("FAST_TP2_PCT", "2.20"))
+# Чтобы не входить “в догонку” — если цена уже улетела, сигнал пропускаем
+MAX_CHASE_PCT = float(os.environ.get("MAX_CHASE_PCT", "1.20"))  # 1.2% от цены на момент кандидата
 
-TREND_SL_PCT = float(os.environ.get("TREND_SL_PCT", "1.20"))
-TREND_TP1_PCT = float(os.environ.get("TREND_TP1_PCT", "2.50"))
-TREND_TP2_PCT = float(os.environ.get("TREND_TP2_PCT", "5.00"))
+# Стоп за структуру + буфер от ATR
+STRUCT_WINDOW_MIN = int(os.environ.get("STRUCT_WINDOW_MIN", "20"))  # берём low/high за последние 20 минут
+ATR_MULT_BUFFER = float(os.environ.get("ATR_MULT_BUFFER", "0.25"))  # буфер = 0.25*ATR к стопу
 
-BOOST_SL_PCT = float(os.environ.get("BOOST_SL_PCT", "1.50"))
-BOOST_TP1_PCT = float(os.environ.get("BOOST_TP1_PCT", "3.50"))
-BOOST_TP2_PCT = float(os.environ.get("BOOST_TP2_PCT", "7.00"))
+# Ограничения SL%
+SL_PCT_MIN = float(os.environ.get("SL_PCT_MIN", "1.20"))
+SL_PCT_MAX = float(os.environ.get("SL_PCT_MAX", "3.50"))
 
-# Ограничения SL (если ATR отдаст странное значение)
-SL_PCT_MIN = float(os.environ.get("SL_PCT_MIN", "0.35"))
-SL_PCT_MAX = float(os.environ.get("SL_PCT_MAX", "2.00"))
+# Take-profit в R (от расстояния до SL)
+TP1_R = float(os.environ.get("TP1_R", "1.6"))
+TP2_R = float(os.environ.get("TP2_R", "3.0"))
 
-# Если объёма нет (vol_ok=False) — не блокируем полностью, а понижаем класс.
-DOWNGRADE_ON_NO_VOLUME = int(os.environ.get("DOWNGRADE_ON_NO_VOLUME", "1"))  # 1 = да
 
 # =========================
 # Bybit V5
@@ -149,7 +141,7 @@ def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
-def fmt_pct_val(x: float, nd: int = 2) -> str:
+def fmt_pct(x: float, nd: int = 2) -> str:
     return f"{x:.{nd}f}%"
 
 
@@ -161,6 +153,94 @@ def fmt_price(x: float) -> str:
     return f"{x:.6f}"
 
 
+def spread_pct(bid: float, ask: float) -> float:
+    if bid <= 0 or ask <= 0:
+        return 999.0
+    mid = (bid + ask) / 2.0
+    if mid <= 0:
+        return 999.0
+    return abs(ask - bid) / mid * 100.0
+
+
+def funding_flag_ru(funding: float, direction: str) -> str:
+    if direction == "LONG" and funding >= FUNDING_HIGH:
+        return "⚠️ funding высокий (лонги перегреты)"
+    if direction == "SHORT" and funding <= FUNDING_LOW:
+        return "⚠️ funding низкий (шорты перегреты)"
+    return "ok"
+
+
+def decide_direction(price_pct: float) -> str:
+    return "LONG" if price_pct >= 0 else "SHORT"
+
+
+def pick_top_symbols(tickers: List[dict], n: int) -> List[dict]:
+    lst = []
+    for t in tickers:
+        sym = str(t.get("symbol", ""))
+        if sym.endswith("USDT"):
+            lst.append(t)
+    lst.sort(key=lambda x: f(x.get("turnover24h", 0.0)), reverse=True)
+    return lst[:n]
+
+
+# =========================
+# Kline analytics: volume spike, ATR, structure low/high
+# =========================
+def kline_metrics(symbol: str) -> Tuple[Optional[bool], Optional[float], Optional[float], Optional[float]]:
+    """
+    returns:
+      vol_ok: last 1m volume >= VOL_SPIKE_MULT * avg(prev)
+      atr_pct: ATR(14) in %
+      struct_low: low of last STRUCT_WINDOW_MIN candles
+      struct_high: high of last STRUCT_WINDOW_MIN candles
+    """
+    try:
+        kl = get_kline(symbol)
+        if not kl or len(kl) < max(30, STRUCT_WINDOW_MIN + 5):
+            return None, None, None, None
+
+        rows = []
+        for r in kl:
+            if len(r) < 7:
+                continue
+            ts = int(r[0]) // 1000
+            o, h, l, c, v = map(float, [r[1], r[2], r[3], r[4], r[5]])
+            rows.append((ts, o, h, l, c, v))
+        rows.sort(key=lambda x: x[0])
+        if len(rows) < max(30, STRUCT_WINDOW_MIN + 5):
+            return None, None, None, None
+
+        # volume spike (last vs avg of previous 30)
+        vols = [x[5] for x in rows[-31:]]
+        last_v = vols[-1]
+        avg_v = sum(vols[:-1]) / max(1, (len(vols) - 1))
+        vol_ok = (avg_v > 0) and (last_v >= VOL_SPIKE_MULT * avg_v)
+
+        # ATR(14)
+        tr = []
+        for i in range(1, len(rows)):
+            prev_c = rows[i - 1][4]
+            h = rows[i][2]
+            l = rows[i][3]
+            tr.append(max(h - l, abs(h - prev_c), abs(l - prev_c)))
+        atr = sum(tr[-14:]) / max(1, len(tr[-14:]))
+        last_price = rows[-1][4]
+        atr_pct = (atr / last_price) * 100.0 if last_price > 0 else None
+
+        window = rows[-STRUCT_WINDOW_MIN:]
+        struct_low = min(x[3] for x in window)
+        struct_high = max(x[2] for x in window)
+
+        return vol_ok, atr_pct, struct_low, struct_high
+    except Exception as e:
+        print("kline_metrics_error", symbol, repr(e), flush=True)
+        return None, None, None, None
+
+
+# =========================
+# State
+# =========================
 @dataclass
 class Point:
     ts: int
@@ -176,16 +256,17 @@ class Point:
 class Candidate:
     symbol: str
     direction: str          # LONG/SHORT
-    tier: str               # FAST/TREND/BOOST
+    tier: str               # TREND/BOOST
     created_ts: int
     ref_price: float
     oi_pct: float
     price_pct: float
     funding: float
     spread_pct: float
-    turnover24h: float
     vol_ok: Optional[bool] = None
-    atr_sl_pct: Optional[float] = None  # ATR-derived SL%
+    atr_pct: Optional[float] = None
+    struct_low: Optional[float] = None
+    struct_high: Optional[float] = None
 
 
 history: Dict[str, List[Point]] = {}
@@ -197,16 +278,6 @@ def prune(sym: str, keep_sec: int = 1800) -> None:
     now = int(time.time())
     arr = history.get(sym, [])
     history[sym] = [p for p in arr if now - p.ts <= keep_sec]
-
-
-def pick_top_symbols(tickers: List[dict], n: int) -> List[dict]:
-    lst = []
-    for t in tickers:
-        sym = str(t.get("symbol", ""))
-        if sym.endswith("USDT"):
-            lst.append(t)
-    lst.sort(key=lambda x: f(x.get("turnover24h", 0.0)), reverse=True)
-    return lst[:n]
 
 
 def get_lookback_point(points: List[Point], lookback_sec: int) -> Optional[Point]:
@@ -221,70 +292,6 @@ def get_lookback_point(points: List[Point], lookback_sec: int) -> Optional[Point
     return best or points[0]
 
 
-def decide_direction(price_pct: float) -> str:
-    return "LONG" if price_pct >= 0 else "SHORT"
-
-
-def funding_flag_ru(funding: float, direction: str) -> str:
-    if direction == "LONG" and funding >= FUNDING_HIGH:
-        return "⚠️ funding высокий (лонги перегреты)"
-    if direction == "SHORT" and funding <= FUNDING_LOW:
-        return "⚠️ funding низкий (шорты перегреты)"
-    return "ok"
-
-
-def kline_volume_and_atr_pct(symbol: str) -> Tuple[Optional[bool], Optional[float]]:
-    """
-    Возвращает:
-    - vol_ok: последняя 1m свеча по объёму >= VOL_SPIKE_MULT * avg(предыдущие N)
-    - atr_pct: ATR(14) в % (можно использовать как SL%)
-    """
-    try:
-        kl = get_kline(symbol)
-        if not kl or len(kl) < 20:
-            return None, None
-
-        rows = []
-        for r in kl:
-            if len(r) < 7:
-                continue
-            ts = int(r[0]) // 1000
-            o, h, l, c, v = map(float, [r[1], r[2], r[3], r[4], r[5]])
-            rows.append((ts, o, h, l, c, v))
-        rows.sort(key=lambda x: x[0])
-        if len(rows) < 20:
-            return None, None
-
-        vols = [x[5] for x in rows[-30:]]
-        last_v = vols[-1]
-        avg_v = sum(vols[:-1]) / max(1, (len(vols) - 1))
-        vol_ok = (avg_v > 0) and (last_v >= VOL_SPIKE_MULT * avg_v)
-
-        tr = []
-        for i in range(1, len(rows)):
-            prev_c = rows[i - 1][4]
-            h = rows[i][2]
-            l = rows[i][3]
-            tr.append(max(h - l, abs(h - prev_c), abs(l - prev_c)))
-        atr = sum(tr[-14:]) / max(1, len(tr[-14:]))
-        last_price = rows[-1][4]
-        atr_pct = (atr / last_price) * 100.0 if last_price > 0 else None
-
-        return vol_ok, atr_pct
-    except Exception as e:
-        print("kline_error", symbol, repr(e), flush=True)
-        return None, None
-
-
-def spread_pct(bid: float, ask: float) -> float:
-    if bid <= 0 or ask <= 0:
-        return 999.0
-    mid = (bid + ask) / 2.0
-    if mid <= 0:
-        return 999.0
-    return abs(ask - bid) / mid * 100.0
-
-
 def cooldown_ok(sym: str) -> bool:
     now = int(time.time())
     return (now - last_sent.get(sym, 0)) >= SYMBOL_COOLDOWN_SEC
@@ -297,66 +304,105 @@ def mark_sent(sym: str) -> None:
 def classify_tier(price_pct: float, oi_pct: float) -> Optional[str]:
     ap = abs(price_pct)
     ao = abs(oi_pct)
-
-    # BOOST
     if ap >= BOOST_PRICE_MOVE_PCT and ao >= BOOST_OI_CHANGE_PCT:
         return "BOOST"
-    # TREND
     if ap >= TREND_PRICE_MOVE_PCT and ao >= TREND_OI_CHANGE_PCT:
         return "TREND"
-    # FAST
-    if ap >= FAST_PRICE_MOVE_PCT and ao >= FAST_OI_CHANGE_PCT:
-        return "FAST"
-
     return None
 
 
-def downgrade_tier(tier: str) -> str:
-    if tier == "BOOST":
-        return "TREND"
-    if tier == "TREND":
-        return "FAST"
-    return tier
+def tier_notional(tier: str) -> float:
+    return NOTIONAL_BOOST if tier == "BOOST" else NOTIONAL_TREND
 
 
-def tier_params(tier: str) -> Tuple[str, float, float, float, float]:
+def entry_zone_from_price(cur_price: float, direction: str) -> Tuple[float, float]:
     """
-    Возвращает:
-    tag_text, notional, sl_pct, tp1_pct, tp2_pct
+    Возвращает (entry_hi, entry_lo) — диапазон для лимитного входа.
+    LONG: зона ниже текущей цены
+    SHORT: зона выше текущей цены
     """
-    if tier == "BOOST":
-        return "🚀 BOOST", NOTIONAL_BOOST, BOOST_SL_PCT, BOOST_TP1_PCT, BOOST_TP2_PCT
-    if tier == "TREND":
-        return "📈 TREND", NOTIONAL_TREND, TREND_SL_PCT, TREND_TP1_PCT, TREND_TP2_PCT
-    return "⚡ FAST", NOTIONAL_FAST, FAST_SL_PCT, FAST_TP1_PCT, FAST_TP2_PCT
+    pb_min = PULLBACK_MIN_PCT / 100.0
+    pb_max = PULLBACK_MAX_PCT / 100.0
 
-
-def calc_levels(entry: float, direction: str, sl_pct: float, tp1_pct: float, tp2_pct: float) -> Tuple[float, float, float]:
     if direction == "LONG":
-        sl = entry * (1.0 - sl_pct / 100.0)
-        tp1 = entry * (1.0 + tp1_pct / 100.0)
-        tp2 = entry * (1.0 + tp2_pct / 100.0)
+        entry_hi = cur_price * (1.0 - pb_min)
+        entry_lo = cur_price * (1.0 - pb_max)
     else:
-        sl = entry * (1.0 + sl_pct / 100.0)
-        tp1 = entry * (1.0 - tp1_pct / 100.0)
-        tp2 = entry * (1.0 - tp2_pct / 100.0)
-    return sl, tp1, tp2
+        entry_lo = cur_price * (1.0 + pb_min)
+        entry_hi = cur_price * (1.0 + pb_max)
+
+    # нормализуем (hi всегда >= lo)
+    hi = max(entry_hi, entry_lo)
+    lo = min(entry_hi, entry_lo)
+    return hi, lo
 
 
-def build_message_ru(c: Candidate, entry_price: float) -> str:
-    tag_text, notional, base_sl_pct, tp1_pct, tp2_pct = tier_params(c.tier)
+def compute_structure_sl(entry: float, direction: str, struct_low: Optional[float], struct_high: Optional[float], atr_pct: Optional[float]) -> float:
+    """
+    Стоп за структуру + ATR-буфер.
+    LONG: SL ниже struct_low
+    SHORT: SL выше struct_high
+    Если структуры нет — fallback на entry +/- SL_PCT_MIN
+    """
+    # буфер в цене = ATR_MULT_BUFFER * ATR (в цене)
+    atr_price = None
+    if atr_pct is not None:
+        atr_price = entry * (atr_pct / 100.0)
 
-    # SL%: если ATR есть — используем как основу, но в пределах
-    sl_pct = c.atr_sl_pct if c.atr_sl_pct is not None else base_sl_pct
+    buffer_price = (ATR_MULT_BUFFER * atr_price) if atr_price is not None else (entry * (0.25 / 100.0))
+
+    if direction == "LONG" and struct_low is not None:
+        sl = struct_low - buffer_price
+    elif direction == "SHORT" and struct_high is not None:
+        sl = struct_high + buffer_price
+    else:
+        # fallback
+        sl = entry * (1.0 - SL_PCT_MIN / 100.0) if direction == "LONG" else entry * (1.0 + SL_PCT_MIN / 100.0)
+
+    # Ограничим SL% (чтобы не было слишком узко/широко)
+    sl_pct = abs(entry - sl) / entry * 100.0 if entry > 0 else SL_PCT_MIN
     sl_pct = clamp(sl_pct, SL_PCT_MIN, SL_PCT_MAX)
 
-    sl, tp1, tp2 = calc_levels(entry_price, c.direction, sl_pct, tp1_pct, tp2_pct)
+    # Пересоберём SL строго под ограниченный sl_pct
+    if direction == "LONG":
+        return entry * (1.0 - sl_pct / 100.0)
+    else:
+        return entry * (1.0 + sl_pct / 100.0)
 
+
+def compute_tp(entry: float, sl: float, direction: str) -> Tuple[float, float]:
+    """
+    TP по R: TP = entry +/- (entry-sl)*R
+    """
+    risk = abs(entry - sl)
+    if direction == "LONG":
+        tp1 = entry + risk * TP1_R
+        tp2 = entry + risk * TP2_R
+    else:
+        tp1 = entry - risk * TP1_R
+        tp2 = entry - risk * TP2_R
+    return tp1, tp2
+
+
+def build_message_ru(c: Candidate, cur_price: float) -> str:
+    tier_text = "🚀 BOOST" if c.tier == "BOOST" else "📈 TREND"
+    notional = tier_notional(c.tier)
     margin = notional / LEVERAGE
-    risk_usd = notional * (sl_pct / 100.0)
 
     dir_ru = "🟢 ЛОНГ" if c.direction == "LONG" else "🔴 ШОРТ"
     fund_note = funding_flag_ru(c.funding, c.direction)
+
+    # Вход по откату — зона
+    entry_hi, entry_lo = entry_zone_from_price(cur_price, c.direction)
+    entry_mid = (entry_hi + entry_lo) / 2.0
+
+    # Стоп за структуру
+    sl = compute_structure_sl(entry_mid, c.direction, c.struct_low, c.struct_high, c.atr_pct)
+    sl_pct = abs(entry_mid - sl) / entry_mid * 100.0 if entry_mid > 0 else SL_PCT_MIN
+
+    tp1, tp2 = compute_tp(entry_mid, sl, c.direction)
+
+    risk_usd = notional * (sl_pct / 100.0)
 
     vol_line = ""
     if c.vol_ok is True:
@@ -365,32 +411,33 @@ def build_message_ru(c: Candidate, entry_price: float) -> str:
         vol_line = "• Объём: нет всплеска ⚠️"
 
     factors = (
-        f"• ΔOI (~5м): {fmt_pct_val(c.oi_pct, 2)}\n"
-        f"• ΔЦена (~2м): {fmt_pct_val(c.price_pct, 2)}\n"
+        f"• ΔOI (~5м): {fmt_pct(c.oi_pct, 2)}\n"
+        f"• ΔЦена (~2м): {fmt_pct(c.price_pct, 2)}\n"
         f"• Funding: {c.funding:.6f} ({fund_note})\n"
-        f"• Спред: {fmt_pct_val(c.spread_pct, 3)}\n"
+        f"• Спред: {fmt_pct(c.spread_pct, 3)}\n"
         f"{vol_line}"
     )
 
     return (
-        f"{tag_text} | {c.symbol} (Bybit USDT-PERP)\n"
+        f"{tier_text} | {c.symbol} (Bybit USDT-PERP)\n"
         f"{dir_ru}\n\n"
+        f"✅ ВХОД ТОЛЬКО ЛИМИТКОЙ (по откату)\n"
+        f"🎯 Зона входа: {fmt_price(entry_lo)} – {fmt_price(entry_hi)}\n"
+        f"⛔ Стоп-лосс: {fmt_price(sl)}  (~{fmt_pct(sl_pct,2)} | риск ≈ ${risk_usd:.2f})\n"
+        f"✅ Тейк 1: {fmt_price(tp1)}  (~{fmt_pct(TP1_R*sl_pct,2)})\n"
+        f"✅ Тейк 2: {fmt_price(tp2)}  (~{fmt_pct(TP2_R*sl_pct,2)})\n\n"
         f"💼 Рекомендация: ${notional:.0f} (плечо x{LEVERAGE:.0f}, маржа ≈ ${margin:.2f})\n\n"
-        f"🎯 Вход: {fmt_price(entry_price)}\n"
-        f"⛔ Стоп-лосс: {fmt_price(sl)} ({fmt_pct_val(sl_pct, 2)} | риск ≈ ${risk_usd:.2f})\n"
-        f"✅ Тейк-профит 1: {fmt_price(tp1)} ({fmt_pct_val(tp1_pct, 2)})\n"
-        f"✅ Тейк-профит 2: {fmt_price(tp2)} ({fmt_pct_val(tp2_pct, 2)})\n\n"
         f"📌 Факторы:\n{factors}\n\n"
-        f"⚠️ Правило: пропустить вход, если цена сдвинулась > {MAX_ENTRY_SLIPPAGE_PCT*100:.2f}% за окно подтверждения"
+        f"⚠️ Если вход не дали — ПРОПУСКАЕШЬ (это нормально)."
     )
 
 
 def main() -> None:
     tg_send(
-        "✅ Bybit Futures Signal Bot запущен\n"
+        "✅ Bybit Futures Bot (работающий режим)\n"
         f"TOP {TOP_N}, опрос={POLL_SECONDS}s, подтверждение={CONFIRM_DELAY_SEC}s\n"
-        f"Депозит=${EQUITY_USD:.0f}, плечо=x{LEVERAGE:.0f}\n"
-        f"Классы: FAST ${NOTIONAL_FAST:.0f} | TREND ${NOTIONAL_TREND:.0f} | BOOST ${NOTIONAL_BOOST:.0f}"
+        f"Режим: вход по откату лимиткой + стоп за структуру\n"
+        f"Классы: TREND ${NOTIONAL_TREND:.0f} | BOOST ${NOTIONAL_BOOST:.0f} | плечо x{LEVERAGE:.0f}"
     )
 
     while True:
@@ -410,18 +457,13 @@ def main() -> None:
                 turnover = f(t.get("turnover24h"))
 
                 p = Point(
-                    ts=now,
-                    price=price,
-                    oi_value=oi_val,
-                    funding=funding,
-                    bid=bid,
-                    ask=ask,
-                    turnover24h=turnover
+                    ts=now, price=price, oi_value=oi_val, funding=funding,
+                    bid=bid, ask=ask, turnover24h=turnover
                 )
                 history.setdefault(sym, []).append(p)
                 prune(sym)
 
-            # 2) create candidates (FAST/TREND/BOOST), но отправка только после подтверждения
+            # 2) create candidates
             created = 0
             for t in top:
                 sym = str(t.get("symbol"))
@@ -446,7 +488,7 @@ def main() -> None:
                 if tier is None:
                     continue
 
-                # cooldown (чтобы не спамить одним символом)
+                # cooldown
                 if not cooldown_ok(sym):
                     continue
 
@@ -466,24 +508,26 @@ def main() -> None:
                     price_pct=price_pct,
                     funding=cur.funding,
                     spread_pct=sp,
-                    turnover24h=cur.turnover24h
                 )
 
-                # kline confirm (volume + ATR)
-                if USE_KLINE_CONFIRM:
-                    vol_ok, atr_pct = kline_volume_and_atr_pct(sym)
+                # Kline metrics
+                if USE_KLINE:
+                    vol_ok, atr_pct, struct_low, struct_high = kline_metrics(sym)
                     cand.vol_ok = vol_ok
-                    if atr_pct is not None:
-                        cand.atr_sl_pct = atr_pct
+                    cand.atr_pct = atr_pct
+                    cand.struct_low = struct_low
+                    cand.struct_high = struct_high
 
-                    # если объёма нет — понижаем класс (а не “в ноль”), чтобы сигналы не исчезали
-                    if DOWNGRADE_ON_NO_VOLUME and (vol_ok is False):
-                        cand.tier = downgrade_tier(cand.tier)
+                    # Если объёма нет — это часто “шум”. Мы не блокируем TREND полностью,
+                    # но BOOST без объёма превращаем в TREND.
+                    if vol_ok is False and cand.tier == "BOOST":
+                        cand.tier = "TREND"
+                    # TREND без объёма оставляем, но он будет реже из-за порогов.
 
                 pending[sym] = cand
                 created += 1
 
-            # 3) confirm candidates and send
+            # 3) confirm and send
             to_delete = []
             confirmed = 0
 
@@ -498,12 +542,13 @@ def main() -> None:
 
                 cur = pts[-1]
 
-                # late-entry check
-                move = abs(cur.price - cand.ref_price) / cand.ref_price if cand.ref_price > 0 else 0.0
-                if move > MAX_ENTRY_SLIPPAGE_PCT:
+                # 3.1) если цена слишком “убежала” с момента кандидата — пропускаем (не догоняем)
+                chase = abs(cur.price - cand.ref_price) / cand.ref_price * 100.0 if cand.ref_price > 0 else 999.0
+                if chase > MAX_CHASE_PCT:
                     to_delete.append(sym)
                     continue
 
+                # 3.2) отправляем сигнал с зоной входа (лимитка) и стопом за структуру
                 tg_send(build_message_ru(cand, cur.price))
                 mark_sent(sym)
                 confirmed += 1
@@ -512,10 +557,7 @@ def main() -> None:
             for sym in to_delete:
                 pending.pop(sym, None)
 
-            print(
-                f"Tick: top={len(top)} created={created} confirmed={confirmed} pending={len(pending)}",
-                flush=True
-            )
+            print(f"Tick: top={len(top)} created={created} confirmed={confirmed} pending={len(pending)}", flush=True)
 
         except Exception as e:
             print("ERROR", repr(e), flush=True)
