@@ -1,18 +1,16 @@
 import os
 import time
-import json
-import sqlite3
 import requests
-from typing import Any, Dict, List, Optional, Tuple
-from collections import defaultdict
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 # =========================
-# Telegram
+# Telegram (обязательно)
 # =========================
-TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 if not TG_TOKEN or not TG_CHAT_ID:
-    raise RuntimeError("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars")
+    raise RuntimeError("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
 
 TG_SEND_URL = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 
@@ -25,435 +23,427 @@ def tg_send(text: str) -> None:
         timeout=20,
     )
     if r.status_code != 200:
-        print("TG_ERROR", r.status_code, r.text[:300], flush=True)
+        print("TG_ERROR", r.status_code, r.text[:200], flush=True)
 
 # =========================
-# Polymarket Data API
+# User settings (под тебя)
 # =========================
-DATA_API_TRADES = "https://data-api.polymarket.com/trades"
+EQUITY_USD = float(os.environ.get("EQUITY_USD", "200"))
+POSITION_USD = float(os.environ.get("POSITION_USD", "20"))     # notional (размер позиции)
+LEVERAGE = float(os.environ.get("LEVERAGE", "10"))
 
-def request_json(url: str, params: dict, retries: int = 3) -> Any:
-    last_err: Optional[str] = None
-    for i in range(retries):
-        try:
-            r = requests.get(url, params=params, timeout=20)
-            if r.status_code != 200:
-                last_err = f"HTTP {r.status_code}: {r.text[:250]}"
-                time.sleep(2 * (i + 1))
-                continue
-            return r.json()
-        except Exception as e:
-            last_err = repr(e)
-            time.sleep(2 * (i + 1))
-    raise RuntimeError(last_err or "unknown error")
-
-def fetch_trades(min_usd: float, limit: int) -> List[Dict[str, Any]]:
-    params = {"limit": limit}
-    # фильтруем по WATCH_MIN_USD на стороне API (меньше мусора)
-    if min_usd > 0:
-        params.update({"filterType": "CASH", "filterAmount": min_usd})
-    data = request_json(DATA_API_TRADES, params=params, retries=3)
-    if not isinstance(data, list):
-        raise RuntimeError(f"Unexpected /trades response type: {type(data)}")
-    return data
+# Late-entry: не входить, если цена убежала слишком далеко за время подтверждения
+MAX_ENTRY_SLIPPAGE_PCT = float(os.environ.get("MAX_ENTRY_SLIPPAGE_PCT", "0.006"))  # 0.6%
 
 # =========================
-# Config (balanced, not too strict)
+# Bot settings
 # =========================
-# 2 уровня сигналов
-INSIDER_MIN_USD = float(os.environ.get("INSIDER_MIN_USD", "3000"))
-WATCH_MIN_USD = float(os.environ.get("WATCH_MIN_USD", "1000"))
+BYBIT_BASE = os.environ.get("BYBIT_BASE", "https://api.bybit.com").rstrip("/")
+POLL_SECONDS = float(os.environ.get("POLL_SECONDS", "10"))
+TOP_N = int(os.environ.get("TOP_N", "20"))
 
-# фильтр по цене сделки
-MAX_ENTRY_PRICE = float(os.environ.get("MAX_ENTRY_PRICE", "0.40"))
-MIN_PRICE = float(os.environ.get("MIN_PRICE", "0.05"))  # режем копеечный арбитраж
+CONFIRM_DELAY_SEC = int(os.environ.get("CONFIRM_DELAY_SEC", "25"))
+SYMBOL_COOLDOWN_SEC = int(os.environ.get("SYMBOL_COOLDOWN_SEC", "600"))  # 10 мин
 
-# пометки
-EARLY_PRICE = float(os.environ.get("EARLY_PRICE", "0.20"))
-CHEAP_PRICE = float(os.environ.get("MAX_CHEAP_PRICE", "0.15"))
+# Lookbacks (строим из накопленной истории тикеров)
+OI_LOOKBACK_SEC = int(os.environ.get("OI_LOOKBACK_SEC", "300"))       # 5м
+PRICE_LOOKBACK_SEC = int(os.environ.get("PRICE_LOOKBACK_SEC", "120")) # 2м
 
-# скорость/свежесть
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "12"))
-TRADES_LIMIT = int(os.environ.get("TRADES_LIMIT", "140"))
-MAX_TRADE_AGE_SEC = int(os.environ.get("MAX_TRADE_AGE_SEC", "600"))  # 10 минут — чтобы сигналы были
+# STRONG thresholds (баланс под разгон; можно подстроить)
+OI_PCT_STRONG = float(os.environ.get("OI_PCT_STRONG", "1.8"))         # ΔOI% за 5м
+PRICE_PCT_STRONG = float(os.environ.get("PRICE_PCT_STRONG", "0.45"))  # ΔPrice% за 2м
 
-# анти-спам
-MARKET_COOLDOWN_SEC = int(os.environ.get("MARKET_COOLDOWN_SEC", "180"))  # 3 минуты
-WALLET_COOLDOWN_SEC = int(os.environ.get("WALLET_COOLDOWN_SEC", "120"))  # 2 минуты
+MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", "0.12"))      # 0.12% спред максимум
 
-# анти-вилочник (работает только когда wallet есть)
-FLIP_WINDOW_SEC = int(os.environ.get("FLIP_WINDOW_SEC", "1800"))         # 30 минут
-MARKET_WINDOW_SEC = int(os.environ.get("MARKET_WINDOW_SEC", "900"))      # 15 минут
-MAX_TRADES_PER_MARKET_WINDOW = int(os.environ.get("MAX_TRADES_PER_MARKET_WINDOW", "8"))
-BLACKLIST_TTL_SEC = int(os.environ.get("BLACKLIST_TTL_SEC", "43200"))    # 12 часов (не сутки)
+# funding risk flags (не блокируем, но помечаем)
+FUNDING_HIGH = float(os.environ.get("FUNDING_HIGH", "0.0002"))  # 0.02% = 0.0002 (Bybit обычно отдаёт долю)
+FUNDING_LOW = float(os.environ.get("FUNDING_LOW", "-0.0002"))
 
-# ВАЖНО: разрешаем сигналы без wallet (иначе часто "тишина")
-ALLOW_NO_WALLET = int(os.environ.get("ALLOW_NO_WALLET", "1"))  # 1 = да
+# Kline confirm (объём + ATR% для SL/TP)
+USE_KLINE_CONFIRM = int(os.environ.get("USE_KLINE_CONFIRM", "1"))
+KLINE_INTERVAL = os.environ.get("KLINE_INTERVAL", "1")   # 1m
+KLINE_LIMIT = int(os.environ.get("KLINE_LIMIT", "60"))    # 60 минут
+VOL_SPIKE_MULT = float(os.environ.get("VOL_SPIKE_MULT", "1.6"))  # всплеск объёма
 
-# Отладка: печатать статистику отсева в логах
-DEBUG_STATS = int(os.environ.get("DEBUG_STATS", "1"))
-DEBUG_EVERY_SEC = int(os.environ.get("DEBUG_EVERY_SEC", "120"))
+# TP/SL logic
+# TP1 = R_MULT1 * stop_pct, TP2 = R_MULT2 * stop_pct
+R_MULT1 = float(os.environ.get("R_MULT1", "1.6"))
+R_MULT2 = float(os.environ.get("R_MULT2", "3.0"))
 
-DB_PATH = os.environ.get("DB_PATH", "scanner.db")
+# ограничение SL% чтобы не было слишком узко/широко
+SL_PCT_MIN = float(os.environ.get("SL_PCT_MIN", "0.35"))
+SL_PCT_MAX = float(os.environ.get("SL_PCT_MAX", "1.20"))
+
+# =========================
+# Bybit V5
+# =========================
+def bybit_get(path: str, params: dict) -> dict:
+    url = f"{BYBIT_BASE}{path}"
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def get_linear_tickers() -> List[dict]:
+    data = bybit_get("/v5/market/tickers", {"category": "linear"})
+    if data.get("retCode") != 0:
+        raise RuntimeError(f"Bybit tickers retCode={data.get('retCode')} msg={data.get('retMsg')}")
+    return data["result"]["list"]
+
+def get_kline(symbol: str) -> List[list]:
+    data = bybit_get("/v5/market/kline", {
+        "category": "linear",
+        "symbol": symbol,
+        "interval": KLINE_INTERVAL,
+        "limit": KLINE_LIMIT
+    })
+    if data.get("retCode") != 0:
+        raise RuntimeError(f"Bybit kline retCode={data.get('retCode')} msg={data.get('retMsg')}")
+    return data["result"]["list"]
 
 # =========================
 # Helpers
 # =========================
-def now_ts() -> int:
-    return int(time.time())
-
-def to_float(x: Any) -> float:
+def f(x, default=0.0) -> float:
     try:
         return float(x)
     except Exception:
+        return default
+
+def pct_change(cur: float, prev: float) -> float:
+    if prev == 0:
         return 0.0
+    return (cur - prev) / prev * 100.0
 
-def to_int(x: Any) -> int:
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+def fmt_pct(x: float, nd=2) -> str:
+    return f"{x:.{nd}f}%"
+
+def fmt_price(x: float) -> str:
+    # для крипты обычно достаточно 4-6 знаков, но оставим умно:
+    if x >= 100:
+        return f"{x:.2f}"
+    if x >= 1:
+        return f"{x:.4f}"
+    return f"{x:.6f}"
+
+@dataclass
+class Point:
+    ts: int
+    price: float
+    oi_value: float
+    funding: float
+    bid: float
+    ask: float
+    turnover24h: float
+
+@dataclass
+class Candidate:
+    symbol: str
+    direction: str          # LONG/SHORT
+    created_ts: int
+    ref_price: float
+    oi_pct: float
+    price_pct: float
+    funding: float
+    spread_pct: float
+    turnover24h: float
+    vol_ok: Optional[bool] = None
+    sl_pct: Optional[float] = None  # SL% derived from ATR%
+
+history: Dict[str, List[Point]] = {}
+pending: Dict[str, Candidate] = {}
+last_sent: Dict[str, int] = {}
+
+def prune(sym: str, keep_sec: int = 1800) -> None:
+    now = int(time.time())
+    arr = history.get(sym, [])
+    history[sym] = [p for p in arr if now - p.ts <= keep_sec]
+
+def pick_top_symbols(tickers: List[dict], n: int) -> List[dict]:
+    lst = []
+    for t in tickers:
+        sym = str(t.get("symbol", ""))
+        if not sym.endswith("USDT"):
+            continue
+        lst.append(t)
+    lst.sort(key=lambda x: f(x.get("turnover24h", 0.0)), reverse=True)
+    return lst[:n]
+
+def get_lookback_point(points: List[Point], lookback_sec: int) -> Optional[Point]:
+    if not points:
+        return None
+    now = points[-1].ts
+    target = now - lookback_sec
+    best = None
+    for p in points:
+        if p.ts <= target:
+            best = p
+    return best or points[0]
+
+def decide_direction(price_pct: float) -> str:
+    return "LONG" if price_pct >= 0 else "SHORT"
+
+def funding_flag(funding: float, direction: str) -> str:
+    if direction == "LONG" and funding >= FUNDING_HIGH:
+        return "⚠️ funding high (лонги перегреты)"
+    if direction == "SHORT" and funding <= FUNDING_LOW:
+        return "⚠️ funding low (шорты перегреты)"
+    return "ok"
+
+def kline_volume_and_atr_pct(symbol: str) -> Tuple[Optional[bool], Optional[float]]:
+    """
+    Возвращает:
+    - vol_ok: последняя 1m свеча по объёму >= VOL_SPIKE_MULT * avg(предыдущие N)
+    - atr_pct: ATR(14) в % (для SL)
+    """
     try:
-        return int(float(x))
-    except Exception:
-        return 0
+        kl = get_kline(symbol)
+        if not kl or len(kl) < 20:
+            return None, None
 
-def extract_wallet(t: Dict[str, Any]) -> str:
-    for k in ("maker", "taker", "trader", "user", "wallet", "address"):
-        v = t.get(k)
-        if isinstance(v, str) and v:
-            return v
-    return ""
+        rows = []
+        for r in kl:
+            if len(r) < 7:
+                continue
+            ts = int(r[0]) // 1000
+            o, h, l, c, v = map(float, [r[1], r[2], r[3], r[4], r[5]])
+            rows.append((ts, o, h, l, c, v))
+        rows.sort(key=lambda x: x[0])
+        if len(rows) < 20:
+            return None, None
 
-def short_addr(addr: str) -> str:
-    if not addr or len(addr) < 12:
-        return "n/a"
-    return f"{addr[:6]}...{addr[-4:]}"
+        # volume spike
+        vols = [x[5] for x in rows[-30:]]
+        last_v = vols[-1]
+        avg_v = sum(vols[:-1]) / max(1, (len(vols) - 1))
+        vol_ok = (avg_v > 0) and (last_v >= VOL_SPIKE_MULT * avg_v)
 
-def side_to_yes_no(side: str) -> str:
-    s = (side or "").upper()
-    if s == "BUY":
-        return "YES"
-    if s == "SELL":
-        return "NO"
-    return s or "?"
+        # ATR(14)
+        tr = []
+        for i in range(1, len(rows)):
+            prev_c = rows[i - 1][4]
+            h = rows[i][2]
+            l = rows[i][3]
+            tr.append(max(h - l, abs(h - prev_c), abs(l - prev_c)))
+        atr = sum(tr[-14:]) / max(1, len(tr[-14:]))
+        last_price = rows[-1][4]
+        atr_pct = (atr / last_price) * 100.0 if last_price > 0 else None
+        return vol_ok, atr_pct
+    except Exception as e:
+        print("kline_error", symbol, repr(e), flush=True)
+        return None, None
 
-def market_link(slug: str) -> str:
-    return f"https://polymarket.com/market/{slug}" if slug else "https://polymarket.com"
+def spread_pct(bid: float, ask: float) -> float:
+    if bid <= 0 or ask <= 0:
+        return 999.0
+    mid = (bid + ask) / 2.0
+    if mid <= 0:
+        return 999.0
+    return abs(ask - bid) / mid * 100.0
 
-def trade_key(t: Dict[str, Any]) -> str:
-    # строковый ключ для SQLite
-    parts = {
-        "tx": t.get("transactionHash"),
-        "id": t.get("tradeId"),
-        "ts": t.get("timestamp"),
-        "p": t.get("price"),
-        "s": t.get("size"),
-        "o": t.get("outcome"),
-        "side": t.get("side"),
-        "slug": t.get("slug"),
-    }
-    return json.dumps(parts, sort_keys=True, ensure_ascii=False)
+def cooldown_ok(sym: str) -> bool:
+    now = int(time.time())
+    return (now - last_sent.get(sym, 0)) >= SYMBOL_COOLDOWN_SEC
 
-# =========================
-# SQLite
-# =========================
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    return conn
+def mark_sent(sym: str) -> None:
+    last_sent[sym] = int(time.time())
 
-def init_db() -> None:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS seen_trades (k TEXT PRIMARY KEY, ts INTEGER)")
-    cur.execute("CREATE TABLE IF NOT EXISTS last_alert (key TEXT PRIMARY KEY, ts INTEGER)")
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS wallet_blacklist (
-        wallet TEXT PRIMARY KEY,
-        reason TEXT,
-        until_ts INTEGER
-      )
-    """)
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS wallet_market_actions (
-        wallet TEXT, slug TEXT, side TEXT, ts INTEGER
-      )
-    """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_wma ON wallet_market_actions(wallet, slug, ts)")
-    conn.commit()
-    conn.close()
+def calc_sl_tp(entry: float, direction: str, sl_pct: float) -> Tuple[float, float, float]:
+    """
+    Возвращает: SL, TP1, TP2 (ценами)
+    TP1 = R_MULT1*SL, TP2 = R_MULT2*SL
+    """
+    tp1_pct = sl_pct * R_MULT1
+    tp2_pct = sl_pct * R_MULT2
 
-def seen_trade(k: str) -> bool:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM seen_trades WHERE k=?", (k,))
-    row = cur.fetchone()
-    conn.close()
-    return row is not None
+    if direction == "LONG":
+        sl = entry * (1.0 - sl_pct / 100.0)
+        tp1 = entry * (1.0 + tp1_pct / 100.0)
+        tp2 = entry * (1.0 + tp2_pct / 100.0)
+    else:
+        sl = entry * (1.0 + sl_pct / 100.0)
+        tp1 = entry * (1.0 - tp1_pct / 100.0)
+        tp2 = entry * (1.0 - tp2_pct / 100.0)
 
-def mark_seen_trade(k: str, ts: int) -> None:
-    conn = db()
-    conn.execute("INSERT OR REPLACE INTO seen_trades(k, ts) VALUES(?, ?)", (k, ts))
-    conn.commit()
-    conn.close()
+    return sl, tp1, tp2
 
-def get_last_alert(key: str) -> int:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT ts FROM last_alert WHERE key=?", (key,))
-    row = cur.fetchone()
-    conn.close()
-    return int(row[0]) if row else 0
+def build_strong_message(c: Candidate, cur_price: float) -> str:
+    # риск/маржа
+    margin = POSITION_USD / LEVERAGE
 
-def set_last_alert(key: str, ts: int) -> None:
-    conn = db()
-    conn.execute("INSERT OR REPLACE INTO last_alert(key, ts) VALUES(?, ?)", (key, ts))
-    conn.commit()
-    conn.close()
+    # SL% (из ATR%, иначе дефолт 0.60)
+    sl_pct = c.sl_pct if c.sl_pct is not None else 0.60
+    sl_pct = clamp(sl_pct, SL_PCT_MIN, SL_PCT_MAX)
 
-def blacklist_wallet(wallet: str, reason: str, ttl_sec: int = BLACKLIST_TTL_SEC) -> None:
-    until_ts = now_ts() + ttl_sec
-    conn = db()
-    conn.execute(
-        "INSERT OR REPLACE INTO wallet_blacklist(wallet, reason, until_ts) VALUES(?, ?, ?)",
-        (wallet, reason, until_ts),
+    sl, tp1, tp2 = calc_sl_tp(cur_price, c.direction, sl_pct)
+
+    # оценка риска в $ при позиции POSITION_USD:
+    risk_usd = POSITION_USD * (sl_pct / 100.0)
+
+    fflag = funding_flag(c.funding, c.direction)
+
+    vol_line = ""
+    if c.vol_ok is True:
+        vol_line = "• Volume: spike ✅"
+    elif c.vol_ok is False:
+        vol_line = "• Volume: no spike ⚠️"
+
+    return (
+        f"🔥 STRONG (confirmed) | {c.symbol} (Bybit USDT-PERP)\n\n"
+        f"Direction: {c.direction}\n"
+        f"Confidence factors:\n"
+        f"• ΔOI (≈5m): {fmt_pct(c.oi_pct,2)}\n"
+        f"• ΔPrice (≈2m): {fmt_pct(c.price_pct,2)}\n"
+        f"• Funding: {c.funding:.6f} ({fflag})\n"
+        f"• Spread: {fmt_pct(c.spread_pct,3)}\n"
+        f"{vol_line}\n\n"
+        f"Trade plan (for ${EQUITY_USD:.0f} dep):\n"
+        f"• Entry: {fmt_price(cur_price)}\n"
+        f"• Stop-Loss: {fmt_price(sl)}  ({fmt_pct(sl_pct,2)} | risk≈${risk_usd:.2f})\n"
+        f"• Take-Profit 1: {fmt_price(tp1)}  ({fmt_pct(sl_pct*R_MULT1,2)})\n"
+        f"• Take-Profit 2: {fmt_price(tp2)}  ({fmt_pct(sl_pct*R_MULT2,2)})\n\n"
+        f"Positioning:\n"
+        f"• Notional: ${POSITION_USD:.0f} | Leverage: x{LEVERAGE:.0f} | Margin≈${margin:.2f}\n"
+        f"Rules:\n"
+        f"• Skip if price moved > {MAX_ENTRY_SLIPPAGE_PCT*100:.2f}% during confirm window\n"
     )
-    conn.commit()
-    conn.close()
 
-def is_blacklisted(wallet: str) -> Tuple[bool, str]:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT reason, until_ts FROM wallet_blacklist WHERE wallet=?", (wallet,))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return False, ""
-    reason, until_ts = str(row[0]), int(row[1])
-    if until_ts <= now_ts():
-        conn = db()
-        conn.execute("DELETE FROM wallet_blacklist WHERE wallet=?", (wallet,))
-        conn.commit()
-        conn.close()
-        return False, ""
-    return True, reason
-
-def record_action(wallet: str, slug: str, side: str, ts: int) -> None:
-    conn = db()
-    conn.execute(
-        "INSERT INTO wallet_market_actions(wallet, slug, side, ts) VALUES(?, ?, ?, ?)",
-        (wallet, slug, side, ts),
-    )
-    conn.execute(
-        "DELETE FROM wallet_market_actions WHERE ts < ?",
-        (ts - max(FLIP_WINDOW_SEC, MARKET_WINDOW_SEC) - 60,),
-    )
-    conn.commit()
-    conn.close()
-
-def detect_flip_and_frequency(wallet: str, slug: str, side: str, ts: int) -> Tuple[bool, str]:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-      SELECT side FROM wallet_market_actions
-      WHERE wallet=? AND slug=? AND ts>=?
-      ORDER BY ts DESC
-      LIMIT 50
-    """, (wallet, slug, ts - FLIP_WINDOW_SEC))
-    sides = [r[0] for r in cur.fetchall()]
-
-    cur.execute("""
-      SELECT COUNT(*) FROM wallet_market_actions
-      WHERE wallet=? AND slug=? AND ts>=?
-    """, (wallet, slug, ts - MARKET_WINDOW_SEC))
-    cnt = int(cur.fetchone()[0])
-    conn.close()
-
-    opp = "SELL" if side == "BUY" else "BUY"
-    if opp in sides:
-        return True, "flip BUY<->SELL (arb/mm)"
-    if cnt >= MAX_TRADES_PER_MARKET_WINDOW:
-        return True, f"too frequent in market ({cnt}/{MARKET_WINDOW_SEC}s)"
-    return False, ""
-
-# =========================
-# Cooldowns
-# =========================
-def should_alert_by_cooldown(slug: str, wallet: str, ts: int) -> bool:
-    if slug and ts - get_last_alert(f"m:{slug}") < MARKET_COOLDOWN_SEC:
-        return False
-    if wallet and ts - get_last_alert(f"w:{wallet}") < WALLET_COOLDOWN_SEC:
-        return False
-    return True
-
-def set_cooldown(slug: str, wallet: str, ts: int) -> None:
-    if slug:
-        set_last_alert(f"m:{slug}", ts)
-    if wallet:
-        set_last_alert(f"w:{wallet}", ts)
-
-# =========================
-# Two-level classifier
-# =========================
-def classify(price: float, notional: float, wallet_present: bool) -> str:
-    # базовые правила: INSIDER/WATCH
-    if notional >= INSIDER_MIN_USD:
-        # если кошелька нет — всё равно разрешаем INSIDER (иначе будет тишина),
-        # но требуем более “раннюю/адекватную” цену, чтобы не ловить мусор.
-        if (not wallet_present) and (not ALLOW_NO_WALLET):
-            return "DROP"
-        if (not wallet_present) and price > 0.30:
-            return "WATCH"
-        return "INSIDER"
-
-    if notional >= WATCH_MIN_USD:
-        if (not wallet_present) and (not ALLOW_NO_WALLET):
-            return "DROP"
-        return "WATCH"
-
-    return "DROP"
-
-def format_msg(level: str, t: Dict[str, Any], price: float, size: float, notional: float, wallet: str) -> str:
-    title = (t.get("title") or "Unknown market").strip()
-    outcome = (t.get("outcome") or "Unknown outcome").strip()
-    side = (t.get("side") or "").upper()
-    slug = (t.get("slug") or "").strip()
-
-    early_tag = " ⚡EARLY" if 0 < price < EARLY_PRICE else ""
-    cheap_tag = " 💎CHEAP" if 0 < price < CHEAP_PRICE else ""
-
-    header = "🔥 INSIDER" if level == "INSIDER" else "👀 WATCH"
-
-    msg = (
-        f"{header} SIGNAL{early_tag}{cheap_tag}\n\n"
-        f"📊 {title}\n"
-        f"📌 СТАВКА: {outcome} — {side_to_yes_no(side)}\n\n"
-        f"💵 Цена: ${price:.3f}\n"
-        f"📦 Акции: {size:,.0f}\n"
-        f"💰 Сумма: ~${notional:,.0f}\n"
-        f"👛 Wallet: {short_addr(wallet)}\n\n"
-        f"🔗 {market_link(slug)}"
-    )
-    if wallet and wallet.startswith("0x"):
-        msg = msg.replace("👛 Wallet:", f"👛 Wallet: {short_addr(wallet)}\nhttps://polygonscan.com/address/{wallet}\n")
-        # аккуратно: чтобы не было дубля "wallet"
-        msg = msg.replace(f"👛 Wallet: {short_addr(wallet)}\nhttps://polygonscan.com/address/{wallet}\n{short_addr(wallet)}", f"👛 Wallet: {short_addr(wallet)}\nhttps://polygonscan.com/address/{wallet}")
-    return msg
-
-# =========================
-# Main
-# =========================
 def main() -> None:
-    init_db()
-
     tg_send(
-        "✅ Scanner started (balanced)\n"
-        f"INSIDER≥${INSIDER_MIN_USD}, WATCH≥${WATCH_MIN_USD}\n"
-        f"price∈[{MIN_PRICE},{MAX_ENTRY_PRICE}], age≤{MAX_TRADE_AGE_SEC}s\n"
-        f"ALLOW_NO_WALLET={ALLOW_NO_WALLET}"
+        "✅ Bybit Futures STRONG-only Bot started\n"
+        f"Top {TOP_N}, poll={POLL_SECONDS}s, confirm={CONFIRM_DELAY_SEC}s\n"
+        f"Deposit=${EQUITY_USD:.0f}, position=${POSITION_USD:.0f}, leverage=x{LEVERAGE:.0f}\n"
+        f"STRONG: ΔOI≥{OI_PCT_STRONG}% (5m) & ΔPrice≥{PRICE_PCT_STRONG}% (2m)"
     )
-
-    last_debug = 0
-    counters = defaultdict(int)
 
     while True:
+        now = int(time.time())
         try:
-            now = now_ts()
-            trades = fetch_trades(WATCH_MIN_USD, limit=TRADES_LIMIT)
-            trades = list(reversed(trades))
+            tickers = get_linear_tickers()
+            top = pick_top_symbols(tickers, TOP_N)
 
-            sent = 0
+            # 1) update history
+            for t in top:
+                sym = str(t.get("symbol"))
+                price = f(t.get("lastPrice"))
+                oi_val = f(t.get("openInterestValue"))
+                funding = f(t.get("fundingRate"))
+                bid = f(t.get("bid1Price"))
+                ask = f(t.get("ask1Price"))
+                turnover = f(t.get("turnover24h"))
 
-            for t in trades:
-                k = trade_key(t)
-                if seen_trade(k):
-                    counters["skip_seen"] += 1
+                p = Point(
+                    ts=now, price=price, oi_value=oi_val, funding=funding,
+                    bid=bid, ask=ask, turnover24h=turnover
+                )
+                history.setdefault(sym, []).append(p)
+                prune(sym)
+
+            # 2) create STRONG candidates only
+            created = 0
+            for t in top:
+                sym = str(t.get("symbol"))
+                pts = history.get(sym, [])
+                if len(pts) < 3:
                     continue
 
-                ts = to_int(t.get("timestamp")) or now
-                age = now - ts
-                if age > MAX_TRADE_AGE_SEC:
-                    counters["skip_age"] += 1
-                    mark_seen_trade(k, ts)
+                cur = pts[-1]
+                sp = spread_pct(cur.bid, cur.ask)
+                if sp > MAX_SPREAD_PCT:
                     continue
 
-                price = to_float(t.get("price"))
-                size = to_float(t.get("size"))
-                notional = price * size
-
-                if not (MIN_PRICE <= price <= MAX_ENTRY_PRICE):
-                    counters["skip_price"] += 1
-                    mark_seen_trade(k, ts)
+                p_lb = get_lookback_point(pts, PRICE_LOOKBACK_SEC)
+                oi_lb = get_lookback_point(pts, OI_LOOKBACK_SEC)
+                if not p_lb or not oi_lb:
                     continue
 
-                if notional < WATCH_MIN_USD:
-                    counters["skip_small"] += 1
-                    mark_seen_trade(k, ts)
+                price_pct = pct_change(cur.price, p_lb.price)
+                oi_pct = pct_change(cur.oi_value, oi_lb.oi_value)
+
+                # STRONG gating
+                if abs(oi_pct) < OI_PCT_STRONG:
+                    continue
+                if abs(price_pct) < PRICE_PCT_STRONG:
                     continue
 
-                slug = (t.get("slug") or "").strip()
-                if not slug:
-                    counters["skip_no_slug"] += 1
-                    mark_seen_trade(k, ts)
+                # cooldown
+                if not cooldown_ok(sym):
                     continue
 
-                wallet = extract_wallet(t)
-                wallet_present = bool(wallet)
-
-                # если wallet нет и запрещено — режем
-                if (not wallet_present) and (not ALLOW_NO_WALLET):
-                    counters["skip_no_wallet"] += 1
-                    mark_seen_trade(k, ts)
+                # already pending
+                if sym in pending:
                     continue
 
-                # blacklist / anti-viloch (только если wallet есть)
-                if wallet_present:
-                    bl, _ = is_blacklisted(wallet)
-                    if bl:
-                        counters["skip_blacklist"] += 1
-                        mark_seen_trade(k, ts)
+                direction = decide_direction(price_pct)
+
+                cand = Candidate(
+                    symbol=sym,
+                    direction=direction,
+                    created_ts=now,
+                    ref_price=cur.price,
+                    oi_pct=oi_pct,
+                    price_pct=price_pct,
+                    funding=cur.funding,
+                    spread_pct=sp,
+                    turnover24h=cur.turnover24h
+                )
+
+                # kline confirm (volume + ATR% for SL)
+                if USE_KLINE_CONFIRM:
+                    vol_ok, atr_pct = kline_volume_and_atr_pct(sym)
+                    cand.vol_ok = vol_ok
+                    if atr_pct is not None:
+                        cand.sl_pct = atr_pct
+
+                    # если объёма нет — не блокируем полностью, но мягко фильтруем:
+                    # для разгона лучше не брать слабые импульсы
+                    if vol_ok is False:
+                        # отсекаем часть мусора, но не “в ноль”
+                        # (если хочешь ещё мягче — убери этот continue)
                         continue
 
-                    side = (t.get("side") or "").upper()
-                    if side in ("BUY", "SELL"):
-                        record_action(wallet, slug, side, ts)
-                        bad, reason = detect_flip_and_frequency(wallet, slug, side, ts)
-                        if bad:
-                            blacklist_wallet(wallet, reason)
-                            counters["skip_viloch"] += 1
-                            mark_seen_trade(k, ts)
-                            continue
+                pending[sym] = cand
+                created += 1
 
-                # cooldown (для уменьшения шума)
-                if not should_alert_by_cooldown(slug, wallet, ts):
-                    counters["skip_cooldown"] += 1
-                    mark_seen_trade(k, ts)
+            # 3) confirm candidates
+            to_delete = []
+            confirmed = 0
+
+            for sym, cand in list(pending.items()):
+                if now - cand.created_ts < CONFIRM_DELAY_SEC:
                     continue
 
-                level = classify(price, notional, wallet_present)
-                if level == "DROP":
-                    counters["skip_class"] += 1
-                    mark_seen_trade(k, ts)
+                pts = history.get(sym, [])
+                if not pts:
+                    to_delete.append(sym)
                     continue
 
-                tg_send(format_msg(level, t, price, size, notional, wallet))
-                set_cooldown(slug, wallet, ts)
-                sent += 1
-                counters["sent"] += 1
+                cur = pts[-1]
 
-                mark_seen_trade(k, ts)
+                # late-entry check
+                move = abs(cur.price - cand.ref_price) / cand.ref_price if cand.ref_price > 0 else 0.0
+                if move > MAX_ENTRY_SLIPPAGE_PCT:
+                    # просто отменяем, без спама
+                    to_delete.append(sym)
+                    continue
 
-            print(f"Tick: fetched={len(trades)} sent={sent}", flush=True)
+                # send confirmed STRONG
+                tg_send(build_strong_message(cand, cur.price))
+                mark_sent(sym)
+                confirmed += 1
+                to_delete.append(sym)
 
-            # debug summary раз в DEBUG_EVERY_SEC
-            if DEBUG_STATS and (now - last_debug >= DEBUG_EVERY_SEC):
-                last_debug = now
-                summary = " | ".join(f"{k}={v}" for k, v in sorted(counters.items()))
-                print("DEBUG:", summary, flush=True)
-                # сбрасываем, чтобы видеть динамику
-                counters.clear()
+            for sym in to_delete:
+                pending.pop(sym, None)
+
+            print(f"Tick: top={len(top)} created={created} confirmed={confirmed} pending={len(pending)}", flush=True)
 
         except Exception as e:
-            print("ERROR:", repr(e), flush=True)
+            print("ERROR", repr(e), flush=True)
             try:
-                tg_send(f"⚠️ Scanner error: {repr(e)[:900]}")
+                tg_send(f"⚠️ Bot error: {repr(e)[:900]}")
             except Exception:
                 pass
 
