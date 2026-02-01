@@ -1,5 +1,4 @@
 aiohttp
-numpy
-cachetools
 tenacity
-requests
+cachetools
+numpy
