@@ -1,1 +1,5 @@
-aiohttp numpy cachetools tenacity requests
+aiohttp
+numpy
+cachetools
+tenacity
+requests
