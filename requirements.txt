@@ -1,4 +1,4 @@
 aiohttp
-tenacity
 cachetools
 numpy
+tenacity
