@@ -2,18 +2,27 @@
 # -*- coding: utf-8 -*-
 
 """
-Bybit Alt Scalping Bot (Async) — WORKING v5 (Orders + Signals)
+Bybit Alt Scalping Bot (Async) — Baseline v14 (Railway-safe)
 
-Что делает:
-- Сканирует Top-N USDT perpetual (linear)
-- Ищет сетап: rejection от robust-границ диапазона + 15m EMA-тренд + 1m BOS подтверждение
-- Фильтры: ATR%, спред, дисбаланс стакана (imbalance)
-- При AUTO_TRADE=true: открывает ордер (Market/Limit) с TP1 и SL (встроенными)
-- Telegram уведомления + CSV лог сигналов
+Внедрено (14 пунктов, без переноса SL в BE):
+1) Один корректный main()
+2) Округления qty/price/SL/TP под шаги инструмента
+3) Lifecycle лимиток: wait/TTL/cancel
+4) Реальная реализация TP2 (через partial TP ордера)
+5) Partials TP1+TP2 (reduceOnly), без переноса SL
+6) Ротация кандидатов по TOP_N
+7) positionIdx параметром (one-way/hedge)
+8) Динамический SL на ATR (MAX_STOP_PCT как предохранитель)
+9) ADX-фильтр
+10) Дедупликация сигналов
+11) Trend logic EMA20/EMA50 + slope
+12) Daily risk guards: max trades/day + max daily risk budget (по планируемому риску)
+13) Market Regime Detector: TREND/RANGE/HIGH_VOL (ADX+ATR%) + лёгкая адаптация фильтров
+14) Orderbook walls: детект крупных стенок возле уровней (подтверждение lo/hi)
 
-Безопасность:
-- category=linear, quote=USDT
-- API ключи: только Read + Trade. Withdraw НЕ включать.
+Railway:
+- booleans в env только 0/1
+- graceful shutdown (SIGINT/SIGTERM)
 """
 
 import os
@@ -21,10 +30,10 @@ import time
 import math
 import csv
 import hmac
-import json
 import hashlib
 import asyncio
 import logging
+import signal
 import urllib.parse
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -34,22 +43,14 @@ import numpy as np
 from cachetools import TTLCache
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-# ==============================
-# LOGGING
-# ==============================
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-logger = logging.getLogger("bybit-scalp")
 
 # ==============================
-# ENV HELPERS
+# ENV HELPERS (Railway-friendly)
 # ==============================
 def env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return default if v is None or str(v).strip() == "" else str(v).strip()
+
 
 def env_int(name: str, default: int) -> int:
     try:
@@ -57,15 +58,45 @@ def env_int(name: str, default: int) -> int:
     except Exception:
         return default
 
+
 def env_float(name: str, default: float) -> float:
     try:
         return float(env_str(name, str(default)))
     except Exception:
         return default
 
-def env_bool(name: str, default: bool) -> bool:
-    v = env_str(name, "1" if default else "0").lower()
-    return v in ("1", "true", "yes", "y", "on")
+
+def env_bool_01(name: str, default: int = 0) -> bool:
+    """Railway: используем только 0/1."""
+    v = env_str(name, str(default))
+    return v == "1"
+
+
+# ==============================
+# LOGGING
+# ==============================
+LOG_LEVEL = env_str("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger("bybit-scalp")
+
+
+# ==============================
+# SHUTDOWN HANDLER
+# ==============================
+shutdown_event = asyncio.Event()
+
+
+def _signal_handler(signum, frame):
+    logger.info(f"Received signal {signum}, shutting down gracefully...")
+    shutdown_event.set()
+
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+
 
 # ==============================
 # CONFIG
@@ -75,13 +106,14 @@ TG_CHAT_ID = env_str("TELEGRAM_CHAT_ID", "")
 
 BYBIT_API_KEY = env_str("BYBIT_API_KEY", "")
 BYBIT_API_SECRET = env_str("BYBIT_API_SECRET", "")
-BYBIT_TESTNET = env_bool("BYBIT_TESTNET", False)
+BYBIT_TESTNET = env_bool_01("BYBIT_TESTNET", 0)
 BASE_URL = "https://api-testnet.bybit.com" if BYBIT_TESTNET else "https://api.bybit.com"
 RECV_WINDOW = env_int("BYBIT_RECV_WINDOW", 5000)
 
-AUTO_TRADE = env_bool("AUTO_TRADE", False)
+AUTO_TRADE = env_bool_01("AUTO_TRADE", 0)
 ENTRY_MODE = env_str("ENTRY_MODE", "auto").lower()  # auto|market|limit
-SET_LEVERAGE = env_bool("SET_LEVERAGE", False)
+SET_LEVERAGE = env_bool_01("SET_LEVERAGE", 0)
+POSITION_IDX = env_int("POSITION_IDX", 0)  # 0 one-way, 1/2 hedge
 
 NOTIONAL_USD = env_float("NOTIONAL_USD", 10.0)
 LEVERAGE = env_int("LEVERAGE", 5)
@@ -102,35 +134,89 @@ ATR_MAX_PCT = env_float("ATR_MAX_PCT", 3.50)
 
 LEVEL_LOOKBACK = env_int("LEVEL_LOOKBACK", 80)
 ROBUST_LEVEL_Q = env_float("ROBUST_LEVEL_Q", 0.05)
-LEVEL_TOL_PCT = env_float("LEVEL_TOL_PCT", 0.20)
+LEVEL_TOL_PCT = env_float("LEVEL_TOL_PCT", 0.20)  # percent
 REJECT_WICK_FRAC = env_float("REJECT_WICK_FRAC", 0.45)
 
-USE_ORDERBOOK = env_bool("USE_ORDERBOOK", True)
+# Orderbook filters
+USE_ORDERBOOK = env_bool_01("USE_ORDERBOOK", 1)
 OB_LIMIT = env_int("OB_LIMIT", 25)
 OB_IMB_MIN = env_float("OB_IMB_MIN", 0.10)
 MAX_SPREAD_PCT = env_float("MAX_SPREAD_PCT", 0.12)
 
-MAX_STOP_PCT = env_float("MAX_STOP_PCT", 0.8)
+# Walls (optional)
+ENABLE_WALL_FILTER = env_bool_01("ENABLE_WALL_FILTER", 0)
+WALL_TOP_N = env_int("WALL_TOP_N", 10)
+WALL_MULT = env_float("WALL_MULT", 5.0)
+WALL_DIST_PCT = env_float("WALL_DIST_PCT", 0.10)  # within 0.10% of level
+
+# Risk / RR
+MAX_STOP_PCT = env_float("MAX_STOP_PCT", 1.0)  # safety cap
 MIN_RR = env_float("MIN_RR", 1.2)
 RR1 = env_float("RR1", 1.3)
 RR2 = env_float("RR2", 1.8)
 
-SIGNAL_TTL_SEC = env_int("SIGNAL_TTL_SEC", 900)
+# ATR stop multiplier
+ATR_STOP_MULT = env_float("ATR_STOP_MULT", 1.5)
 
-ENABLE_SIGNAL_LOG = env_bool("ENABLE_SIGNAL_LOG", True)
+# ADX / Regime
+ADX_LEN = env_int("ADX_LEN", 14)
+ADX_MIN = env_float("ADX_MIN", 20.0)  # below => skip
+REGIME_TREND_ADX = env_float("REGIME_TREND_ADX", 25.0)
+REGIME_HIGHVOL_ATR_PCT = env_float("REGIME_HIGHVOL_ATR_PCT", 1.50)
+
+# Regime adaptations (light)
+RANGE_MIN_RR = env_float("RANGE_MIN_RR", 1.4)
+RANGE_REJECT_WICK_FRAC = env_float("RANGE_REJECT_WICK_FRAC", 0.50)
+RANGE_CONFIRM_LOOKBACK = env_int("RANGE_CONFIRM_LOOKBACK", 8)
+
+HIGHVOL_MIN_RR = env_float("HIGHVOL_MIN_RR", 1.3)
+HIGHVOL_ATR_STOP_MULT = env_float("HIGHVOL_ATR_STOP_MULT", 1.8)
+
+TREND_MIN_RR = env_float("TREND_MIN_RR", 1.2)
+
+# Signal lifecycle
+SIGNAL_TTL_SEC = env_int("SIGNAL_TTL_SEC", 900)
+SIGNAL_DEDUP_SEC = env_int("SIGNAL_DEDUP_SEC", 60)
+
+# Limit order lifecycle
+LIMIT_WAIT_SEC = env_int("LIMIT_WAIT_SEC", 25)
+LIMIT_POLL_SEC = env_int("LIMIT_POLL_SEC", 2)
+
+# Partials (no SL move)
+ENABLE_PARTIAL_TP = env_bool_01("ENABLE_PARTIAL_TP", 1)
+TP1_SHARE = env_float("TP1_SHARE", 0.50)
+
+# Daily risk guards
+USE_DAILY_GUARDS = env_bool_01("USE_DAILY_GUARDS", 1)
+MAX_TRADES_PER_DAY = env_int("MAX_TRADES_PER_DAY", 10)
+MAX_DAILY_RISK_USD = env_float("MAX_DAILY_RISK_USD", 50.0)
+
+# Logging
+ENABLE_SIGNAL_LOG = env_bool_01("ENABLE_SIGNAL_LOG", 1)
 SIGNAL_LOG_FILE = env_str("SIGNAL_LOG_FILE", "signals_log.csv")
 
+# Universe
 ALLOWED_CATEGORY = env_str("ALLOWED_CATEGORY", "linear")
 ALLOWED_QUOTE = env_str("ALLOWED_QUOTE", "USDT")
 
+
 # ==============================
-# CACHES / STATE
+# STATE / CACHES
 # ==============================
-KLINE_CACHE = TTLCache(maxsize=600, ttl=90)
-OB_CACHE = TTLCache(maxsize=600, ttl=45)
-TREND_CACHE = TTLCache(maxsize=600, ttl=240)
+KLINE_CACHE = TTLCache(maxsize=800, ttl=60)
+OB_RAW_CACHE = TTLCache(maxsize=800, ttl=30)
+TREND_CACHE = TTLCache(maxsize=800, ttl=180)
 INSTR_CACHE: Dict[str, Dict[str, float]] = {}
+
 COOLDOWN: Dict[str, float] = {}
+RECENT_SIGNALS: Dict[str, int] = {}  # key -> unix ts
+
+_ROT_OFFSET = 0  # candidate rotation
+
+_daily_date = None
+_daily_trades = 0
+_daily_risk_used = 0.0
+
 
 # ==============================
 # DATA
@@ -144,15 +230,14 @@ class Candle:
     c: float
     v: float
 
+
 @dataclass
 class Signal:
     signal_id: str
     ts: int
     symbol: str
-    side: str              # "Buy" or "Sell"
+    side: str
     setup: str
-    entry_low: float
-    entry_high: float
     entry_mid: float
     stop: float
     tp1: float
@@ -160,14 +245,24 @@ class Signal:
     ttl_sec: int
     reason: str
     atr_pct: float
+    adx: float
     spread_pct: float
     ob_imb: float
+    regime: str
+    bid_wall: int
+    ask_wall: int
+
 
 # ==============================
 # UTILS
 # ==============================
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def utc_date_str() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
 
 def robust_range(prices: List[float], q: float) -> Tuple[float, float]:
     if not prices:
@@ -179,33 +274,20 @@ def robust_range(prices: List[float], q: float) -> Tuple[float, float]:
         hi_i = lo_i
     return ps[lo_i], ps[hi_i]
 
+
 def wick_fraction(c: Candle) -> float:
     rng = max(1e-12, c.h - c.l)
     body = abs(c.c - c.o)
     return (rng - body) / rng
 
-def candle_rejection_at_edge(c: Candle, edge: float, is_low_edge: bool) -> bool:
-    if wick_fraction(c) < REJECT_WICK_FRAC:
+
+def candle_rejection_at_edge(c: Candle, edge: float, is_low_edge: bool, wick_min: float) -> bool:
+    if wick_fraction(c) < wick_min:
         return False
     if is_low_edge:
         return (c.l <= edge) and (c.c > edge)
     return (c.h >= edge) and (c.c < edge)
 
-def atr_pct_fast(candles: List[Candle], length: int) -> float:
-    if len(candles) < length + 1:
-        return 0.0
-    highs = np.array([c.h for c in candles], dtype=float)
-    lows  = np.array([c.l for c in candles], dtype=float)
-    closes = np.array([c.c for c in candles], dtype=float)
-
-    tr1 = highs[1:] - lows[1:]
-    tr2 = np.abs(highs[1:] - closes[:-1])
-    tr3 = np.abs(lows[1:]  - closes[:-1])
-    tr = np.maximum.reduce([tr1, tr2, tr3])
-
-    atr = float(np.mean(tr[-length:]))
-    price = float(closes[-1])
-    return (atr / price) * 100.0 if price > 0 else 0.0
 
 def ema(values: List[float], period: int) -> List[float]:
     if not values or period <= 1:
@@ -219,17 +301,143 @@ def ema(values: List[float], period: int) -> List[float]:
         out.append(e)
     return out
 
-def should_cooldown(symbol: str) -> bool:
-    return time.time() < COOLDOWN.get(symbol, 0.0)
-
-def set_cooldown(symbol: str) -> None:
-    COOLDOWN[symbol] = time.time() + SYMBOL_COOLDOWN_SEC
 
 def round_step(x: float, step: float, mode: str = "down") -> float:
     if step <= 0:
         return x
     k = x / step
     return (math.ceil(k) if mode == "up" else math.floor(k)) * step
+
+
+def fmt_qty(q: float) -> str:
+    return f"{q:.8f}".rstrip("0").rstrip(".")
+
+
+def fmt_price(p: float) -> str:
+    return f"{p:.8f}".rstrip("0").rstrip(".")
+
+
+def should_cooldown(symbol: str) -> bool:
+    return time.time() < COOLDOWN.get(symbol, 0.0)
+
+
+def set_cooldown(symbol: str) -> None:
+    COOLDOWN[symbol] = time.time() + SYMBOL_COOLDOWN_SEC
+
+
+def can_generate_signal(symbol: str, side: str) -> bool:
+    key = f"{symbol}_{side}"
+    last_ts = RECENT_SIGNALS.get(key, 0)
+    now_s = int(time.time())
+    if now_s - last_ts < SIGNAL_DEDUP_SEC:
+        return False
+    RECENT_SIGNALS[key] = now_s
+    return True
+
+
+def _reset_daily_guards_if_needed() -> None:
+    global _daily_date, _daily_trades, _daily_risk_used
+    d = utc_date_str()
+    if _daily_date != d:
+        _daily_date = d
+        _daily_trades = 0
+        _daily_risk_used = 0.0
+
+
+def daily_guards_allow(risk_usd: float) -> bool:
+    if not USE_DAILY_GUARDS:
+        return True
+    _reset_daily_guards_if_needed()
+    if _daily_trades >= MAX_TRADES_PER_DAY:
+        return False
+    if _daily_risk_used + risk_usd > MAX_DAILY_RISK_USD:
+        return False
+    return True
+
+
+def daily_guards_commit(risk_usd: float) -> None:
+    global _daily_trades, _daily_risk_used
+    if not USE_DAILY_GUARDS:
+        return
+    _reset_daily_guards_if_needed()
+    _daily_trades += 1
+    _daily_risk_used += risk_usd
+
+
+# ==============================
+# INDICATORS
+# ==============================
+def atr_value(candles: List[Candle], length: int) -> float:
+    if len(candles) < length + 1:
+        return 0.0
+    highs = np.array([c.h for c in candles], dtype=float)
+    lows = np.array([c.l for c in candles], dtype=float)
+    closes = np.array([c.c for c in candles], dtype=float)
+    tr1 = highs[1:] - lows[1:]
+    tr2 = np.abs(highs[1:] - closes[:-1])
+    tr3 = np.abs(lows[1:] - closes[:-1])
+    tr = np.maximum.reduce([tr1, tr2, tr3])
+    return float(np.mean(tr[-length:]))
+
+
+def atr_pct_fast(candles: List[Candle], length: int) -> float:
+    atr = atr_value(candles, length)
+    price = float(candles[-1].c) if candles else 0.0
+    return (atr / price) * 100.0 if price > 0 else 0.0
+
+
+def adx_value(candles: List[Candle], length: int) -> float:
+    """Wilder ADX (last value)."""
+    if len(candles) < length + 2:
+        return 0.0
+    highs = np.array([c.h for c in candles], dtype=float)
+    lows = np.array([c.l for c in candles], dtype=float)
+    closes = np.array([c.c for c in candles], dtype=float)
+
+    up_move = highs[1:] - highs[:-1]
+    down_move = lows[:-1] - lows[1:]
+
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    tr1 = highs[1:] - lows[1:]
+    tr2 = np.abs(highs[1:] - closes[:-1])
+    tr3 = np.abs(lows[1:] - closes[:-1])
+    tr = np.maximum.reduce([tr1, tr2, tr3])
+
+    def wilder_smooth(x: np.ndarray, n: int) -> np.ndarray:
+        out = np.zeros_like(x)
+        out[:n] = np.nan
+        if len(x) <= n:
+            return out
+        out[n] = np.sum(x[:n])
+        for i in range(n + 1, len(x)):
+            out[i] = out[i - 1] - (out[i - 1] / n) + x[i]
+        return out
+
+    tr_s = wilder_smooth(tr, length)
+    plus_s = wilder_smooth(plus_dm, length)
+    minus_s = wilder_smooth(minus_dm, length)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        plus_di = 100.0 * (plus_s / tr_s)
+        minus_di = 100.0 * (minus_s / tr_s)
+        dx = 100.0 * (np.abs(plus_di - minus_di) / (plus_di + minus_di))
+
+    adx = wilder_smooth(np.nan_to_num(dx), length)
+    last = adx[-1]
+    if np.isnan(last) or not np.isfinite(last):
+        return 0.0
+    return float(last)
+
+
+def detect_regime(adx: float, atrp: float) -> str:
+    if atrp >= REGIME_HIGHVOL_ATR_PCT:
+        return "HIGH_VOL"
+    if adx >= REGIME_TREND_ADX:
+        return "TREND"
+    return "RANGE"
+
 
 # ==============================
 # TELEGRAM
@@ -242,338 +450,367 @@ async def tg_send(session: aiohttp.ClientSession, text: str) -> None:
         async with session.post(
             url,
             json={"chat_id": TG_CHAT_ID, "text": text, "disable_web_page_preview": True},
-            timeout=10,
+            timeout=aiohttp.ClientTimeout(total=10),
         ):
             return
-    except Exception:
-        return
+    except Exception as e:
+        logger.warning(f"Telegram send failed: {e}")
+
 
 # ==============================
-# BYBIT SIGNING (v5)
+# BYBIT API
 # ==============================
-class BybitTempError(RuntimeError):
-    pass
+def sign_bybit(params: dict, secret: str) -> str:
+    query = urllib.parse.urlencode(sorted(params.items()))
+    return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-RETRY_EXC = (aiohttp.ClientError, asyncio.TimeoutError, BybitTempError)
 
-def _sign(secret: str, payload: str) -> str:
-    return hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
-
-def _json_compact(obj: dict) -> str:
-    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
-
-def _encode_query(params: dict) -> str:
-    # encode consistently with sorted keys
-    items = []
-    for k in sorted(params.keys()):
-        v = params[k]
-        if v is None:
-            continue
-        items.append((k, str(v)))
-    return urllib.parse.urlencode(items)
-
-def _headers_private(ts: str, payload: str) -> Dict[str, str]:
-    prehash = ts + BYBIT_API_KEY + str(RECV_WINDOW) + payload
-    sign = _sign(BYBIT_API_SECRET, prehash)
-    return {
-        "X-BAPI-API-KEY": BYBIT_API_KEY,
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-SIGN-TYPE": "2",
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-RECV-WINDOW": str(RECV_WINDOW),
-        "Content-Type": "application/json",
-    }
-
-@retry(stop=stop_after_attempt(5), wait=wait_exponential(min=0.8, max=12),
-       retry=retry_if_exception_type(RETRY_EXC), reraise=True)
-async def api_get(session: aiohttp.ClientSession, path: str, params: dict = None, timeout: int = 12) -> dict:
-    url = BASE_URL + path
-    async with session.get(url, params=params or {}, timeout=timeout) as r:
-        j = await r.json()
-        code = int(j.get("retCode", 0))
-        if code in (10006, 10018) or r.status in (429, 500, 502, 503, 504):
-            raise BybitTempError(f"temporary bybit error {code}: {j.get('retMsg')}")
-        return j
-
-@retry(stop=stop_after_attempt(5), wait=wait_exponential(min=0.8, max=12),
-       retry=retry_if_exception_type(RETRY_EXC), reraise=True)
-async def api_get_private(session: aiohttp.ClientSession, path: str, params: dict, timeout: int = 12) -> dict:
-    if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-        raise RuntimeError("Missing BYBIT_API_KEY/BYBIT_API_SECRET")
-
-    query = _encode_query(params or {})
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
+)
+async def bybit_get(session: aiohttp.ClientSession, endpoint: str, params: dict) -> dict:
     ts = str(now_ms())
-    prehash = ts + BYBIT_API_KEY + str(RECV_WINDOW) + query
-    sign = _sign(BYBIT_API_SECRET, prehash)
+    p = {**params, "api_key": BYBIT_API_KEY, "timestamp": ts, "recv_window": str(RECV_WINDOW)}
+    p["sign"] = sign_bybit(p, BYBIT_API_SECRET)
+    url = f"{BASE_URL}{endpoint}"
+    async with session.get(url, params=p, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        data = await resp.json()
+        if data.get("retCode") != 0:
+            raise ValueError(f"API error: {data}")
+        return data.get("result", {})
 
-    headers = {
-        "X-BAPI-API-KEY": BYBIT_API_KEY,
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-SIGN-TYPE": "2",
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-RECV-WINDOW": str(RECV_WINDOW),
-    }
-    url = BASE_URL + path
 
-    async with session.get(url, params=params, headers=headers, timeout=timeout) as r:
-        j = await r.json()
-        code = int(j.get("retCode", 0))
-        if code in (10006, 10018) or r.status in (429, 500, 502, 503, 504):
-            raise BybitTempError(f"temporary bybit error {code}: {j.get('retMsg')}")
-        return j
-
-@retry(stop=stop_after_attempt(5), wait=wait_exponential(min=0.8, max=12),
-       retry=retry_if_exception_type(RETRY_EXC), reraise=True)
-async def api_post_private(session: aiohttp.ClientSession, path: str, body: dict, timeout: int = 12) -> dict:
-    if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-        raise RuntimeError("Missing BYBIT_API_KEY/BYBIT_API_SECRET")
-
-    payload = _json_compact(body)
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
+)
+async def bybit_post(session: aiohttp.ClientSession, endpoint: str, params: dict) -> dict:
     ts = str(now_ms())
-    headers = _headers_private(ts, payload)
+    p = {**params, "api_key": BYBIT_API_KEY, "timestamp": ts, "recv_window": str(RECV_WINDOW)}
+    p["sign"] = sign_bybit(p, BYBIT_API_SECRET)
+    url = f"{BASE_URL}{endpoint}"
+    async with session.post(url, json=p, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        data = await resp.json()
+        if data.get("retCode") != 0:
+            raise ValueError(f"API error: {data}")
+        return data.get("result", {})
 
-    url = BASE_URL + path
-    async with session.post(url, data=payload, headers=headers, timeout=timeout) as r:
-        j = await r.json()
-        code = int(j.get("retCode", 0))
-        if code in (10006, 10018) or r.status in (429, 500, 502, 503, 504):
-            raise BybitTempError(f"temporary bybit error {code}: {j.get('retMsg')}")
-        return j
 
 # ==============================
 # MARKET DATA
 # ==============================
-async def bybit_kline(session: aiohttp.ClientSession, symbol: str, interval_min: int, limit: int) -> List[Candle]:
-    key = f"k_{symbol}_{interval_min}_{limit}"
+async def bybit_tickers_top(session: aiohttp.ClientSession, n: int) -> List[dict]:
+    try:
+        url = f"{BASE_URL}/v5/market/tickers"
+        params = {"category": ALLOWED_CATEGORY}
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            data = await resp.json()
+            if data.get("retCode") != 0:
+                return []
+            items = data.get("result", {}).get("list", []) or []
+            valid = [
+                t for t in items
+                if str(t.get("symbol", "")).endswith(ALLOWED_QUOTE) and float(t.get("turnover24h", 0) or 0) > 0
+            ]
+            valid.sort(key=lambda x: float(x.get("turnover24h", 0) or 0), reverse=True)
+            return valid[:n]
+    except Exception as e:
+        logger.error(f"Failed to fetch tickers: {e}")
+        return []
+
+
+async def bybit_kline(session: aiohttp.ClientSession, symbol: str, interval_min: int, limit: int) -> List:
+    key = f"kline_{symbol}_{interval_min}_{limit}"
     if key in KLINE_CACHE:
         return KLINE_CACHE[key]
+    try:
+        url = f"{BASE_URL}/v5/market/kline"
+        params = {"category": ALLOWED_CATEGORY, "symbol": symbol, "interval": str(interval_min), "limit": str(limit)}
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            data = await resp.json()
+            if data.get("retCode") != 0:
+                return []
+            rows = data.get("result", {}).get("list", []) or []
+            candles = [
+                Candle(ts=int(r[0]), o=float(r[1]), h=float(r[2]), l=float(r[3]), c=float(r[4]), v=float(r[5]))
+                for r in reversed(rows)
+            ]
+            KLINE_CACHE[key] = candles
+            return candles
+    except Exception as e:
+        logger.error(f"Failed to fetch klines for {symbol}: {e}")
+        return []
 
-    j = await api_get(session, "/v5/market/kline", {
-        "category": ALLOWED_CATEGORY,
-        "symbol": symbol,
-        "interval": str(interval_min),
-        "limit": str(limit),
-    })
 
-    rows = j.get("result", {}).get("list", []) or []
-    out: List[Candle] = []
-    for r in reversed(rows):
-        try:
-            out.append(Candle(
-                ts=int(r[0]),
-                o=float(r[1]),
-                h=float(r[2]),
-                l=float(r[3]),
-                c=float(r[4]),
-                v=float(r[5]),
-            ))
-        except Exception:
-            continue
+async def bybit_orderbook_raw(session: aiohttp.ClientSession, symbol: str, limit: int) -> Tuple[List[List[str]], List[List[str]]]:
+    key = f"obraw_{symbol}_{limit}"
+    if key in OB_RAW_CACHE:
+        return OB_RAW_CACHE[key]
+    try:
+        url = f"{BASE_URL}/v5/market/orderbook"
+        params = {"category": ALLOWED_CATEGORY, "symbol": symbol, "limit": str(limit)}
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            data = await resp.json()
+            if data.get("retCode") != 0:
+                return [], []
+            ob = data.get("result", {}) or {}
+            bids = ob.get("b", []) or []
+            asks = ob.get("a", []) or []
+            OB_RAW_CACHE[key] = (bids, asks)
+            return bids, asks
+    except Exception as e:
+        logger.error(f"Failed to fetch orderbook for {symbol}: {e}")
+        return [], []
 
-    KLINE_CACHE[key] = out
-    return out
 
-async def bybit_orderbook(session: aiohttp.ClientSession, symbol: str, limit: int) -> Tuple[float, float, float]:
-    key = f"ob_{symbol}_{limit}"
-    if key in OB_CACHE:
-        return OB_CACHE[key]
+def _wall_near_level(level: float, rows: List[List[str]], top_n: int) -> int:
+    if not ENABLE_WALL_FILTER or top_n <= 0 or level <= 0:
+        return 0
+    sl = rows[:min(top_n, len(rows))]
+    if not sl:
+        return 0
+    sizes = np.array([float(x[1]) for x in sl], dtype=float)
+    avg = float(np.mean(sizes)) if len(sizes) else 0.0
+    if avg <= 0:
+        return 0
+    for p_str, s_str in sl:
+        p = float(p_str)
+        s = float(s_str)
+        if s >= avg * WALL_MULT:
+            dist_pct = abs(p - level) / level * 100.0
+            if dist_pct <= WALL_DIST_PCT:
+                return 1
+    return 0
 
-    j = await api_get(session, "/v5/market/orderbook", {
-        "category": ALLOWED_CATEGORY,
-        "symbol": symbol,
-        "limit": str(limit),
-    })
 
-    res = j.get("result", {}) or {}
-    bids = res.get("b", []) or []
-    asks = res.get("a", []) or []
-
-    if not bids or not asks:
-        return 0.0, 0.0, 0.0
-
-    bid1 = float(bids[0][0])
-    ask1 = float(asks[0][0])
-
-    bid_sum = sum(float(q) for _, q in bids)
-    ask_sum = sum(float(q) for _, q in asks)
-    tot = bid_sum + ask_sum
-    imb = (bid_sum - ask_sum) / tot if tot > 0 else 0.0
-
-    OB_CACHE[key] = (bid1, ask1, imb)
-    return bid1, ask1, imb
-
-async def bybit_tickers_top(session: aiohttp.ClientSession, top_n: int) -> List[dict]:
-    j = await api_get(session, "/v5/market/tickers", {"category": ALLOWED_CATEGORY})
-    lst = j.get("result", {}).get("list", []) or []
-
-    out = []
-    for t in lst:
-        sym = t.get("symbol", "")
-        if not sym.endswith(ALLOWED_QUOTE):
-            continue
-        try:
-            turn = float(t.get("turnover24h", 0) or 0)
-            last = float(t.get("lastPrice", 0) or 0)
-        except Exception:
-            continue
-        if turn <= 0 or last <= 0:
-            continue
-        out.append(t)
-
-    out.sort(key=lambda x: float(x.get("turnover24h", 0) or 0), reverse=True)
-    return out[:max(1, top_n)]
-
-async def bybit_instrument_steps(session: aiohttp.ClientSession, symbol: str) -> Dict[str, float]:
+# ==============================
+# INSTRUMENT INFO / SIZING
+# ==============================
+async def fetch_instrument_info(session: aiohttp.ClientSession, symbol: str) -> Dict[str, float]:
     if symbol in INSTR_CACHE:
         return INSTR_CACHE[symbol]
+    try:
+        url = f"{BASE_URL}/v5/market/instruments-info"
+        params = {"category": ALLOWED_CATEGORY, "symbol": symbol}
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            data = await resp.json()
+            if data.get("retCode") != 0:
+                return {}
+            items = data.get("result", {}).get("list", []) or []
+            if not items:
+                return {}
+            info = items[0]
+            lot = info.get("lotSizeFilter", {}) or {}
+            pricef = info.get("priceFilter", {}) or {}
+            result = {
+                "qty_step": float(lot.get("qtyStep", 0.001)),
+                "min_qty": float(lot.get("minOrderQty", 0.001)),
+                "price_tick": float(pricef.get("tickSize", 0.01)),
+            }
+            INSTR_CACHE[symbol] = result
+            return result
+    except Exception as e:
+        logger.error(f"Failed to fetch instrument info for {symbol}: {e}")
+        return {}
 
-    j = await api_get(session, "/v5/market/instruments-info", {
-        "category": ALLOWED_CATEGORY,
-        "symbol": symbol,
-    })
 
-    lst = j.get("result", {}).get("list", []) or []
-    if not lst:
-        raise RuntimeError(f"instrument info missing for {symbol}")
+async def compute_qty_float(session: aiohttp.ClientSession, symbol: str, price: float) -> Tuple[float, float, float]:
+    info = await fetch_instrument_info(session, symbol)
+    qty_step = info.get("qty_step", 0.001)
+    min_qty = info.get("min_qty", 0.001)
+    raw_qty = (NOTIONAL_USD * LEVERAGE) / max(price, 1e-12)
+    qty = round_step(raw_qty, qty_step, "down")
+    qty = max(qty, min_qty)
+    return float(qty), float(qty_step), float(min_qty)
 
-    info = lst[0]
-    lot = info.get("lotSizeFilter", {}) or {}
-    pricef = info.get("priceFilter", {}) or {}
-
-    steps = {
-        "qtyStep": float(lot.get("qtyStep", 0.0) or 0.0) or 0.001,
-        "minQty": float(lot.get("minOrderQty", 0.0) or 0.0) or 0.001,
-        "minNotional": float(lot.get("minOrderAmt", 0.0) or 0.0) or 0.0,
-        "priceStep": float(pricef.get("tickSize", 0.0) or 0.0) or 0.0001,
-    }
-
-    INSTR_CACHE[symbol] = steps
-    return steps
 
 # ==============================
-# TRADING
+# ORDERS
 # ==============================
-async def has_open_position(session: aiohttp.ClientSession) -> bool:
-    j = await api_get_private(session, "/v5/position/list", {"category": ALLOWED_CATEGORY})
-    lst = j.get("result", {}).get("list", []) or []
-    for p in lst:
-        try:
-            size = float(p.get("size", 0) or 0)
-            if size != 0.0:
-                return True
-        except Exception:
-            continue
-    return False
-
-async def set_leverage_if_needed(session: aiohttp.ClientSession, symbol: str, lev: int) -> None:
+async def set_leverage_if_needed(session: aiohttp.ClientSession, symbol: str, leverage: int) -> None:
     if not SET_LEVERAGE:
         return
-    body = {
-        "category": ALLOWED_CATEGORY,
-        "symbol": symbol,
-        "buyLeverage": str(lev),
-        "sellLeverage": str(lev),
-    }
-    j = await api_post_private(session, "/v5/position/set-leverage", body)
-    if int(j.get("retCode", 0)) != 0:
-        logger.warning(f"set leverage failed {symbol}: {j.get('retMsg')}")
+    try:
+        await bybit_post(
+            session,
+            "/v5/position/set-leverage",
+            {"category": ALLOWED_CATEGORY, "symbol": symbol, "buyLeverage": str(leverage), "sellLeverage": str(leverage)},
+        )
+        logger.info(f"Leverage set to {leverage}x for {symbol}")
+    except Exception as e:
+        logger.warning(f"Failed to set leverage for {symbol}: {e}")
 
-async def compute_qty(session: aiohttp.ClientSession, symbol: str, price: float) -> float:
-    steps = await bybit_instrument_steps(session, symbol)
-    qty_step = steps["qtyStep"]
-    min_qty = steps["minQty"]
-    min_notional = steps["minNotional"]
 
-    pos_value = NOTIONAL_USD * float(LEVERAGE)
-    raw_qty = pos_value / price
-    qty = round_step(raw_qty, qty_step, "down")
+async def has_open_position(session: aiohttp.ClientSession) -> bool:
+    try:
+        result = await bybit_get(session, "/v5/position/list", {"category": ALLOWED_CATEGORY, "settleCoin": ALLOWED_QUOTE})
+        positions = result.get("list", []) or []
+        return any(float(p.get("size", 0) or 0) > 0 for p in positions)
+    except Exception as e:
+        logger.warning(f"Failed to check positions: {e}")
+        return False
 
-    if qty < min_qty:
-        qty = min_qty
 
-    if min_notional > 0 and qty * price < min_notional:
-        qty = round_step(min_notional / price, qty_step, "up")
+async def get_order_status(session: aiohttp.ClientSession, symbol: str, order_id: str) -> str:
+    try:
+        res = await bybit_get(session, "/v5/order/realtime", {"category": ALLOWED_CATEGORY, "symbol": symbol, "orderId": order_id})
+        items = res.get("list", []) or []
+        if not items:
+            return "Unknown"
+        return str(items[0].get("orderStatus", "Unknown"))
+    except Exception as e:
+        logger.warning(f"Order status failed: {e}")
+        return "Unknown"
 
-    return float(qty)
 
-async def place_order(session: aiohttp.ClientSession, symbol: str, side: str, qty: float,
-                      price: Optional[float], sl: float, tp: float) -> Tuple[bool, str]:
-    body = {
-        "category": ALLOWED_CATEGORY,
-        "symbol": symbol,
-        "side": side,  # "Buy"/"Sell"
-        "orderType": "Market" if price is None else "Limit",
-        "qty": str(qty),
-        "timeInForce": "IOC" if price is None else "GTC",
-        "reduceOnly": False,
-        "closeOnTrigger": False,
-        "positionIdx": 0,
-        "takeProfit": str(tp),
-        "stopLoss": str(sl),
-        "tpTriggerBy": "LastPrice",
-        "slTriggerBy": "LastPrice",
-    }
-    if price is not None:
-        body["price"] = str(price)
+async def cancel_order(session: aiohttp.ClientSession, symbol: str, order_id: str) -> bool:
+    try:
+        await bybit_post(session, "/v5/order/cancel", {"category": ALLOWED_CATEGORY, "symbol": symbol, "orderId": order_id})
+        return True
+    except Exception as e:
+        logger.warning(f"Cancel failed: {e}")
+        return False
 
-    j = await api_post_private(session, "/v5/order/create", body)
-    if int(j.get("retCode", 0)) != 0:
-        return False, f"{j.get('retMsg')} (code {j.get('retCode')})"
-    oid = j.get("result", {}).get("orderId", "")
-    return True, oid
 
-# ==============================
-# SIGNAL LOG
-# ==============================
-def ensure_log_header() -> None:
-    if not ENABLE_SIGNAL_LOG:
+async def place_entry_order(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    side: str,
+    qty: float,
+    entry_price: Optional[float],
+    stop: float,
+) -> Tuple[bool, str]:
+    try:
+        info = await fetch_instrument_info(session, symbol)
+        tick = info.get("price_tick", 0.01)
+
+        sl_mode = "down" if side == "Buy" else "up"
+        stop_r = round_step(stop, tick, sl_mode)
+
+        params = {
+            "category": ALLOWED_CATEGORY,
+            "symbol": symbol,
+            "side": side,
+            "orderType": "Market" if entry_price is None else "Limit",
+            "qty": fmt_qty(qty),
+            "stopLoss": fmt_price(stop_r),
+            "timeInForce": "GTC",
+            "positionIdx": POSITION_IDX,
+        }
+
+        if entry_price is not None:
+            p_mode = "down" if side == "Buy" else "up"
+            price_r = round_step(entry_price, tick, p_mode)
+            params["price"] = fmt_price(price_r)
+
+        result = await bybit_post(session, "/v5/order/create", params)
+        oid = str(result.get("orderId", ""))
+        return (oid != ""), oid
+    except Exception as e:
+        return False, str(e)
+
+
+async def place_tp_order(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    side: str,
+    qty: float,
+    price: float,
+) -> Tuple[bool, str]:
+    try:
+        info = await fetch_instrument_info(session, symbol)
+        tick = info.get("price_tick", 0.01)
+
+        p_mode = "up" if side == "Sell" else "down"
+        price_r = round_step(price, tick, p_mode)
+
+        params = {
+            "category": ALLOWED_CATEGORY,
+            "symbol": symbol,
+            "side": side,
+            "orderType": "Limit",
+            "qty": fmt_qty(qty),
+            "price": fmt_price(price_r),
+            "timeInForce": "GTC",
+            "reduceOnly": True,
+            "positionIdx": POSITION_IDX,
+        }
+        result = await bybit_post(session, "/v5/order/create", params)
+        oid = str(result.get("orderId", ""))
+        return (oid != ""), oid
+    except Exception as e:
+        return False, str(e)
+
+
+async def place_partials_if_enabled(session: aiohttp.ClientSession, sig: Signal, qty: float, qty_step: float, min_qty: float) -> None:
+    if not ENABLE_PARTIAL_TP:
         return
-    if os.path.exists(SIGNAL_LOG_FILE):
-        return
-    header = [
-        "ts","signal_id","symbol","side","setup",
-        "entry_low","entry_high","entry_mid",
-        "stop","tp1","tp2","ttl_sec",
-        "atr_pct","spread_pct","ob_imb",
-        "auto_trade","order_id","reason"
-    ]
-    with open(SIGNAL_LOG_FILE, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(header)
 
-def append_log(sig: Signal, order_id: str) -> None:
-    if not ENABLE_SIGNAL_LOG:
-        return
-    ensure_log_header()
-    row = [
-        sig.ts, sig.signal_id, sig.symbol, sig.side, sig.setup,
-        sig.entry_low, sig.entry_high, sig.entry_mid,
-        sig.stop, sig.tp1, sig.tp2, sig.ttl_sec,
-        sig.atr_pct, sig.spread_pct, sig.ob_imb,
-        int(AUTO_TRADE), order_id, sig.reason
-    ]
-    with open(SIGNAL_LOG_FILE, "a", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(row)
+    share = min(max(TP1_SHARE, 0.0), 1.0)
+    q1 = round_step(qty * share, qty_step, "down")
+    q2 = round_step(qty - q1, qty_step, "down")
+
+    if q1 < min_qty or q2 < min_qty:
+        q1 = qty
+        q2 = 0.0
+
+    opp = "Sell" if sig.side == "Buy" else "Buy"
+
+    ok1, r1 = await place_tp_order(session, sig.symbol, opp, q1, sig.tp1)
+    if ok1:
+        logger.info(f"TP1 reduceOnly placed: {sig.symbol} qty={fmt_qty(q1)} oid={r1}")
+    else:
+        logger.warning(f"TP1 place failed: {sig.symbol} | {r1}")
+
+    if q2 > 0:
+        ok2, r2 = await place_tp_order(session, sig.symbol, opp, q2, sig.tp2)
+        if ok2:
+            logger.info(f"TP2 reduceOnly placed: {sig.symbol} qty={fmt_qty(q2)} oid={r2}")
+        else:
+            logger.warning(f"TP2 place failed: {sig.symbol} | {r2}")
+
 
 # ==============================
-# STRATEGY
+# SIGNAL DETECTION
 # ==============================
-async def trend_filter(session: aiohttp.ClientSession, symbol: str) -> int:
+async def trend_filter(session: aiohttp.ClientSession, symbol: str) -> Tuple[int, float]:
     key = f"trend_{symbol}_{TF_TREND_MIN}"
     if key in TREND_CACHE:
         return TREND_CACHE[key]
 
-    candles = await bybit_kline(session, symbol, TF_TREND_MIN, 120)
+    candles = await bybit_kline(session, symbol, TF_TREND_MIN, 60)
+    if len(candles) < 60:
+        TREND_CACHE[key] = (0, 0.0)
+        return 0, 0.0
+
     closes = [c.c for c in candles]
-    if len(closes) < 60:
-        TREND_CACHE[key] = 0
-        return 0
+    e_fast = ema(closes, 20)
+    e_slow = ema(closes, 50)
 
-    e_fast = ema(closes, 20)[-1]
-    e_slow = ema(closes, 50)[-1]
-    trend = 1 if e_fast > e_slow else -1 if e_fast < e_slow else 0
+    def slope(series: List[float], k: int = 5) -> float:
+        if len(series) < k + 1 or series[-k] == 0:
+            return 0.0
+        return (series[-1] - series[-k]) / series[-k]
 
-    TREND_CACHE[key] = trend
-    return trend
+    current_fast = e_fast[-1]
+    current_slow = e_slow[-1]
+    fast_slope = slope(e_fast, 5)
+    slow_slope = slope(e_slow, 5)
+    slope_score = float(abs(fast_slope) + abs(slow_slope))
+
+    if current_fast > current_slow and fast_slope > 0 and slow_slope > 0:
+        out = (1, slope_score)
+    elif current_fast < current_slow and fast_slope < 0 and slow_slope < 0:
+        out = (-1, slope_score)
+    else:
+        out = (0, slope_score)
+
+    TREND_CACHE[key] = out
+    return out
+
 
 def confirm_bos(candles: List[Candle], side: str, lookback: int) -> bool:
     if len(candles) < lookback:
@@ -584,6 +821,7 @@ def confirm_bos(candles: List[Candle], side: str, lookback: int) -> bool:
     if side == "Buy":
         return last > max(prev)
     return last < min(prev)
+
 
 async def detect_signal(session: aiohttp.ClientSession, symbol: str) -> Optional[Signal]:
     need = max(LEVEL_LOOKBACK, ATR_LEN) + 10
@@ -603,36 +841,79 @@ async def detect_signal(session: aiohttp.ClientSession, symbol: str) -> Optional
     last = ctx[-1]
     mid = last.c
 
-    # стакан + спред
-    spread_pct = 0.0
-    imb = 0.0
-    if USE_ORDERBOOK:
-        bid1, ask1, imb = await bybit_orderbook(session, symbol, OB_LIMIT)
-        if bid1 <= 0 or ask1 <= 0:
-            return None
-        spread_pct = ((ask1 - bid1) / ((ask1 + bid1) / 2.0)) * 100.0
-        if spread_pct > MAX_SPREAD_PCT:
-            return None
+    trend, slope_score = await trend_filter(session, symbol)
+    trend_candles = await bybit_kline(session, symbol, TF_TREND_MIN, 80)
+    adx = adx_value(trend_candles, ADX_LEN) if trend_candles else 0.0
+    regime = detect_regime(adx, atrp)
 
-    trend = await trend_filter(session, symbol)
+    wick_min = REJECT_WICK_FRAC
+    min_rr_eff = MIN_RR
+    confirm_lb = CONFIRM_LOOKBACK
+    atr_mult = ATR_STOP_MULT
+
+    if regime == "RANGE":
+        if adx < ADX_MIN:
+            return None
+        wick_min = max(wick_min, RANGE_REJECT_WICK_FRAC)
+        min_rr_eff = max(min_rr_eff, RANGE_MIN_RR)
+        confirm_lb = max(confirm_lb, RANGE_CONFIRM_LOOKBACK)
+    elif regime == "HIGH_VOL":
+        min_rr_eff = max(min_rr_eff, HIGHVOL_MIN_RR)
+        atr_mult = max(atr_mult, HIGHVOL_ATR_STOP_MULT)
+    else:
+        min_rr_eff = max(min_rr_eff, TREND_MIN_RR)
 
     tol = (LEVEL_TOL_PCT / 100.0) * mid
     near_low = (abs(mid - lo) <= tol) or (last.l <= lo + tol)
     near_high = (abs(mid - hi) <= tol) or (last.h >= hi - tol)
 
-    conf = await bybit_kline(session, symbol, TF_CONFIRM_MIN, max(CONFIRM_LOOKBACK + 2, 20))
-    if len(conf) < CONFIRM_LOOKBACK:
+    conf = await bybit_kline(session, symbol, TF_CONFIRM_MIN, max(confirm_lb + 2, 20))
+    if len(conf) < confirm_lb:
         return None
 
-    # LONG
-    if near_low and candle_rejection_at_edge(last, lo, True):
-        look = max(CONFIRM_LOOKBACK, 7) if trend == -1 else CONFIRM_LOOKBACK
-        if not confirm_bos(conf, "Buy", look):
+    spread_pct = 0.0
+    imb = 0.0
+    bid_wall = 0
+    ask_wall = 0
+    if USE_ORDERBOOK:
+        bids, asks = await bybit_orderbook_raw(session, symbol, OB_LIMIT)
+        if not bids or not asks:
             return None
-        if USE_ORDERBOOK and imb < OB_IMB_MIN:
+        bid1 = float(bids[0][0])
+        ask1 = float(asks[0][0])
+        if bid1 <= 0 or ask1 <= 0:
             return None
 
-        stop = min(last.l, lo) * (1 - 0.001)  # буфер 0.1%
+        spread_pct = ((ask1 - bid1) / ((ask1 + bid1) / 2.0)) * 100.0
+        if spread_pct > MAX_SPREAD_PCT:
+            return None
+
+        bid_vol = sum(float(b[1]) for b in bids)
+        ask_vol = sum(float(a[1]) for a in asks)
+        total = bid_vol + ask_vol
+        imb = (bid_vol - ask_vol) / total if total > 0 else 0.0
+
+        bid_wall = _wall_near_level(lo, bids, WALL_TOP_N)
+        ask_wall = _wall_near_level(hi, asks, WALL_TOP_N)
+
+    atr_abs = atr_value(ctx, ATR_LEN)
+    if atr_abs <= 0:
+        return None
+
+    if near_low and candle_rejection_at_edge(last, lo, True, wick_min):
+        if not can_generate_signal(symbol, "Buy"):
+            return None
+
+        look = max(confirm_lb, 7) if trend == -1 else confirm_lb
+        if not confirm_bos(conf, "Buy", look):
+            return None
+
+        if USE_ORDERBOOK and imb < OB_IMB_MIN:
+            return None
+        if ENABLE_WALL_FILTER and bid_wall == 0:
+            return None
+
+        stop = min(last.l, lo) - (atr_abs * atr_mult)
         stop_pct = ((mid - stop) / mid) * 100.0
         if stop_pct <= 0 or stop_pct > MAX_STOP_PCT:
             return None
@@ -641,7 +922,7 @@ async def detect_signal(session: aiohttp.ClientSession, symbol: str) -> Optional
         tp1 = mid + risk * RR1
         tp2 = mid + risk * RR2
         rr = (tp1 - mid) / risk if risk > 0 else 0.0
-        if rr < MIN_RR:
+        if rr < min_rr_eff:
             return None
 
         return Signal(
@@ -649,29 +930,36 @@ async def detect_signal(session: aiohttp.ClientSession, symbol: str) -> Optional
             ts=now_ms(),
             symbol=symbol,
             side="Buy",
-            setup="A_reject_low",
-            entry_low=mid * 0.999,
-            entry_high=mid * 1.001,
+            setup="reject_low",
             entry_mid=mid,
             stop=stop,
             tp1=tp1,
             tp2=tp2,
             ttl_sec=SIGNAL_TTL_SEC,
-            reason=f"reject_low lo={lo:.6g} atr%={atrp:.2f} trend={trend} ob_imb={imb:.3f}",
+            reason=f"lo={lo:.6g} atr%={atrp:.2f} adx={adx:.1f} reg={regime} tr={trend} imb={imb:.3f} slope={slope_score:.4f}",
             atr_pct=atrp,
+            adx=adx,
             spread_pct=spread_pct,
             ob_imb=imb,
+            regime=regime,
+            bid_wall=bid_wall,
+            ask_wall=ask_wall,
         )
 
-    # SHORT
-    if near_high and candle_rejection_at_edge(last, hi, False):
-        look = max(CONFIRM_LOOKBACK, 7) if trend == 1 else CONFIRM_LOOKBACK
-        if not confirm_bos(conf, "Sell", look):
-            return None
-        if USE_ORDERBOOK and imb > -OB_IMB_MIN:
+    if near_high and candle_rejection_at_edge(last, hi, False, wick_min):
+        if not can_generate_signal(symbol, "Sell"):
             return None
 
-        stop = max(last.h, hi) * (1 + 0.001)
+        look = max(confirm_lb, 7) if trend == 1 else confirm_lb
+        if not confirm_bos(conf, "Sell", look):
+            return None
+
+        if USE_ORDERBOOK and imb > -OB_IMB_MIN:
+            return None
+        if ENABLE_WALL_FILTER and ask_wall == 0:
+            return None
+
+        stop = max(last.h, hi) + (atr_abs * atr_mult)
         stop_pct = ((stop - mid) / mid) * 100.0
         if stop_pct <= 0 or stop_pct > MAX_STOP_PCT:
             return None
@@ -680,7 +968,7 @@ async def detect_signal(session: aiohttp.ClientSession, symbol: str) -> Optional
         tp1 = mid - risk * RR1
         tp2 = mid - risk * RR2
         rr = (mid - tp1) / risk if risk > 0 else 0.0
-        if rr < MIN_RR:
+        if rr < min_rr_eff:
             return None
 
         return Signal(
@@ -688,53 +976,133 @@ async def detect_signal(session: aiohttp.ClientSession, symbol: str) -> Optional
             ts=now_ms(),
             symbol=symbol,
             side="Sell",
-            setup="A_reject_high",
-            entry_low=mid * 0.999,
-            entry_high=mid * 1.001,
+            setup="reject_high",
             entry_mid=mid,
             stop=stop,
             tp1=tp1,
             tp2=tp2,
             ttl_sec=SIGNAL_TTL_SEC,
-            reason=f"reject_high hi={hi:.6g} atr%={atrp:.2f} trend={trend} ob_imb={imb:.3f}",
+            reason=f"hi={hi:.6g} atr%={atrp:.2f} adx={adx:.1f} reg={regime} tr={trend} imb={imb:.3f} slope={slope_score:.4f}",
             atr_pct=atrp,
+            adx=adx,
             spread_pct=spread_pct,
             ob_imb=imb,
+            regime=regime,
+            bid_wall=bid_wall,
+            ask_wall=ask_wall,
         )
 
     return None
 
+
+# ==============================
+# LOGGING
+# ==============================
+def append_log(sig: Signal, order_id: str) -> None:
+    if not ENABLE_SIGNAL_LOG:
+        return
+    try:
+        file_exists = os.path.isfile(SIGNAL_LOG_FILE)
+        with open(SIGNAL_LOG_FILE, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow([
+                    "timestamp", "signal_id", "symbol", "side", "setup",
+                    "entry_mid", "stop", "tp1", "tp2",
+                    "atr_pct", "adx", "regime", "spread_pct", "ob_imb",
+                    "bid_wall", "ask_wall",
+                    "reason", "order_id"
+                ])
+            writer.writerow([
+                time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(sig.ts // 1000)),
+                sig.signal_id,
+                sig.symbol,
+                sig.side,
+                sig.setup,
+                fmt_price(sig.entry_mid),
+                fmt_price(sig.stop),
+                fmt_price(sig.tp1),
+                fmt_price(sig.tp2),
+                f"{sig.atr_pct:.3f}",
+                f"{sig.adx:.2f}",
+                sig.regime,
+                f"{sig.spread_pct:.3f}",
+                f"{sig.ob_imb:.3f}",
+                str(sig.bid_wall),
+                str(sig.ask_wall),
+                sig.reason,
+                order_id,
+            ])
+    except Exception as e:
+        logger.error(f"Failed to write log: {e}")
+
+
 def format_signal(sig: Signal) -> str:
-    side = "LONG" if sig.side == "Buy" else "SHORT"
+    side = "🟢 LONG" if sig.side == "Buy" else "🔴 SHORT"
+    risk_pct = abs((sig.entry_mid - sig.stop) / sig.entry_mid) * 100.0
+    reward1_pct = abs((sig.tp1 - sig.entry_mid) / sig.entry_mid) * 100.0
     return (
-        f"📌 {sig.symbol} | {side} | {sig.setup}\n"
-        f"Entry: {sig.entry_low:.6g}–{sig.entry_high:.6g} (mid {sig.entry_mid:.6g})\n"
-        f"SL: {sig.stop:.6g}\n"
-        f"TP1: {sig.tp1:.6g} | TP2: {sig.tp2:.6g}\n"
-        f"ATR%: {sig.atr_pct:.2f} | Spread%: {sig.spread_pct:.3f} | OB_imb: {sig.ob_imb:.3f}\n"
-        f"TTL: {sig.ttl_sec}s\n"
-        f"{sig.reason}"
+        f"{side} | {sig.symbol}\n"
+        f"📊 Setup: {sig.setup} | Regime: {sig.regime}\n"
+        f"💰 Entry: {sig.entry_mid:.6g}\n"
+        f"🛑 Stop: {sig.stop:.6g} (-{risk_pct:.2f}%)\n"
+        f"🎯 TP1: {sig.tp1:.6g} (+{reward1_pct:.2f}%)\n"
+        f"🎯 TP2: {sig.tp2:.6g}\n"
+        f"📈 ATR: {sig.atr_pct:.2f}% | ADX: {sig.adx:.1f} | Spread: {sig.spread_pct:.3f}%\n"
+        f"📚 OB imb: {sig.ob_imb:+.3f} | Walls: bid={sig.bid_wall} ask={sig.ask_wall}\n"
+        f"⏱ TTL: {sig.ttl_sec}s"
     )
 
-# ==============================
-# MAIN LOOP
-# ==============================
-async def scan_and_trade(session: aiohttp.ClientSession) -> None:
-    # 1) тикеры по обороту
-    tickers = await bybit_tickers_top(session, TOP_N)
-    symbols = [t["symbol"] for t in tickers][:TOP_N]
-    candidates = symbols[:max(1, MAX_CANDIDATES)]
 
-    # 2) правило: одна позиция
+# ==============================
+# SCAN / TRADE
+# ==============================
+def rotate_candidates(symbols: List[str]) -> List[str]:
+    global _ROT_OFFSET
+    if not symbols:
+        return []
+    n = len(symbols)
+    k = max(1, min(MAX_CANDIDATES, n))
+    start = _ROT_OFFSET % n
+    out = []
+    for i in range(k):
+        out.append(symbols[(start + i) % n])
+    _ROT_OFFSET = (start + k) % n
+    return out
+
+
+async def wait_limit_fill(session: aiohttp.ClientSession, symbol: str, order_id: str, ttl: int) -> bool:
+    max_wait = min(LIMIT_WAIT_SEC, max(5, ttl))
+    t_end = time.time() + max_wait
+    while time.time() < t_end and not shutdown_event.is_set():
+        st = await get_order_status(session, symbol, order_id)
+        if st == "Filled":
+            return True
+        if st in ("Cancelled", "Rejected"):
+            return False
+        await asyncio.sleep(LIMIT_POLL_SEC)
+    await cancel_order(session, symbol, order_id)
+    return False
+
+
+async def scan_and_trade(session: aiohttp.ClientSession) -> None:
+    tickers = await bybit_tickers_top(session, TOP_N)
+    if not tickers:
+        logger.warning("No tickers fetched")
+        return
+
+    symbols = [t.get("symbol", "") for t in tickers if t.get("symbol")]
+    symbols = symbols[:TOP_N]
+    candidates = rotate_candidates(symbols)
+
     if AUTO_TRADE:
-        try:
-            if await has_open_position(session):
-                logger.info("Open position detected -> skip new entries")
-                return
-        except Exception as e:
-            logger.warning(f"position check failed: {e}")
+        if await has_open_position(session):
+            logger.info("Open position exists -> skipping new entries")
+            return
 
     for sym in candidates:
+        if shutdown_event.is_set():
+            break
         if should_cooldown(sym):
             continue
 
@@ -749,66 +1117,105 @@ async def scan_and_trade(session: aiohttp.ClientSession) -> None:
 
             order_id = ""
             if AUTO_TRADE:
+                qty, qty_step, min_qty = await compute_qty_float(session, sym, sig.entry_mid)
+                planned_risk_usd = abs(sig.entry_mid - sig.stop) * qty
+
+                if not daily_guards_allow(planned_risk_usd):
+                    logger.warning("Daily guards block trade")
+                    await tg_send(session, "⛔ Daily guards: trade blocked (trades/risk limit).")
+                    set_cooldown(sym)
+                    append_log(sig, "")
+                    return
+
                 await set_leverage_if_needed(session, sym, LEVERAGE)
 
                 use_market = ENTRY_MODE in ("auto", "market")
                 limit_price = sig.entry_mid if ENTRY_MODE == "limit" else None
 
-                qty = await compute_qty(session, sym, sig.entry_mid)
-
-                ok, oid_or_err = await place_order(
+                ok, oid_or_err = await place_entry_order(
                     session=session,
                     symbol=sym,
                     side=sig.side,
                     qty=qty,
-                    price=None if use_market else limit_price,
-                    sl=sig.stop,
-                    tp=sig.tp1,  # TP2 оставляем как “дальний” ориентир
+                    entry_price=None if use_market else limit_price,
+                    stop=sig.stop,
                 )
+                if not ok:
+                    fail_msg = f"❌ Entry failed: {sym} {sig.side} | {oid_or_err}"
+                    logger.warning(fail_msg)
+                    await tg_send(session, fail_msg)
+                    set_cooldown(sym)
+                    append_log(sig, "")
+                    return
 
-                if ok:
-                    order_id = oid_or_err
-                    await tg_send(session, f"✅ Order placed: {sym} {sig.side} qty={qty} oid={order_id}")
-                    logger.info(f"Order placed: {sym} {sig.side} qty={qty} oid={order_id}")
-                else:
-                    await tg_send(session, f"❌ Order failed: {sym} {sig.side} | {oid_or_err}")
-                    logger.warning(f"Order failed: {sym} {sig.side} | {oid_or_err}")
+                order_id = oid_or_err
+
+                if not use_market:
+                    filled = await wait_limit_fill(session, sym, order_id, sig.ttl_sec)
+                    if not filled:
+                        msg2 = f"🟡 Limit not filled, cancelled: {sym} oid={order_id}"
+                        logger.info(msg2)
+                        await tg_send(session, msg2)
+                        set_cooldown(sym)
+                        append_log(sig, order_id)
+                        return
+
+                await place_partials_if_enabled(session, sig, qty, qty_step, min_qty)
+                daily_guards_commit(planned_risk_usd)
+
+                success_msg = f"✅ Entry placed: {sym} {sig.side} qty={fmt_qty(qty)} oid={order_id}"
+                logger.info(success_msg)
+                await tg_send(session, success_msg)
 
                 set_cooldown(sym)
 
             append_log(sig, order_id)
-            return  # максимум 1 сделка/сигнал за цикл
+            return
 
         except Exception as e:
             logger.error(f"Error processing {sym}: {e}", exc_info=True)
             continue
 
+
+# ==============================
+# MAIN
+# ==============================
 async def main() -> None:
     global BASE_URL
     BASE_URL = "https://api-testnet.bybit.com" if BYBIT_TESTNET else "https://api.bybit.com"
 
     if AUTO_TRADE and (not BYBIT_API_KEY or not BYBIT_API_SECRET):
-        raise SystemExit("AUTO_TRADE=true but BYBIT_API_KEY/BYBIT_API_SECRET are missing.")
+        raise SystemExit("AUTO_TRADE=1 but BYBIT_API_KEY/BYBIT_API_SECRET missing")
 
-    logger.info(f"Start | testnet={BYBIT_TESTNET} auto_trade={AUTO_TRADE} notional={NOTIONAL_USD} lev={LEVERAGE}")
+    logger.info(f"Starting bot | testnet={BYBIT_TESTNET} | auto_trade={AUTO_TRADE} | entry_mode={ENTRY_MODE}")
+    logger.info(f"Notional=${NOTIONAL_USD} | Lev={LEVERAGE} | TOP_N={TOP_N} | MAX_CANDIDATES={MAX_CANDIDATES}")
+    if USE_DAILY_GUARDS:
+        logger.info(f"Daily guards: max_trades={MAX_TRADES_PER_DAY} | max_risk_usd={MAX_DAILY_RISK_USD}")
 
-    timeout = aiohttp.ClientTimeout(total=25)
+    timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        await tg_send(session, "🟢 Bybit bot запущен")
-        while True:
+        await tg_send(session, f"🟢 Bot started | testnet={BYBIT_TESTNET} | auto={AUTO_TRADE}")
+
+        cycle = 0
+        while not shutdown_event.is_set():
             t0 = time.perf_counter()
+            cycle += 1
             try:
                 await scan_and_trade(session)
             except Exception as e:
-                logger.error(f"Main loop error: {e}", exc_info=True)
+                logger.error(f"Cycle #{cycle} error: {e}", exc_info=True)
+
             dt = time.perf_counter() - t0
-            logger.info(f"cycle done in {dt:.2f}s")
-            await asyncio.sleep(POLL_SECONDS)
+            logger.info(f"✓ Cycle #{cycle} done in {dt:.2f}s")
+
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=POLL_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+
+        logger.info("Bot stopped")
+        await tg_send(session, "🔴 Bot stopped")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-if __name__ == "__main__":
-    main()
-
-
