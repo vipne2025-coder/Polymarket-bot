@@ -459,15 +459,28 @@ async def tg_send(session: aiohttp.ClientSession, text: str) -> None:
 
 
 # ==============================
-# BYBIT API
+# BYBIT API (v5 signType=2, Railway-safe)
 # ==============================
-def sign_bybit_v5(api_key: str, api_secret: str, timestamp: str, recv_window: str, body: str) -> str:
-    msg = f"{timestamp}{api_key}{recv_window}{body}"
-    return hmac.new(
-        api_secret.encode(),
-        msg.encode(),
-        hashlib.sha256
-    ).hexdigest()
+def _build_query(params: dict) -> str:
+    """Stable query string for signing (sorted, urlencode)."""
+    if not params:
+        return ""
+    return urllib.parse.urlencode(sorted(params.items()))
+
+def sign_bybit_v5(api_key: str, api_secret: str, timestamp: str, recv_window: str, payload: str) -> str:
+    """Bybit v5 signature (signType=2): sha256_hmac(timestamp+api_key+recv_window+payload)."""
+    msg = f"{timestamp}{api_key}{recv_window}{payload}"
+    return hmac.new(api_secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
+def _headers_v5(signature: str, timestamp: str, recv_window: str) -> dict:
+    return {
+        "Content-Type": "application/json",
+        "X-BAPI-SIGN": signature,
+        "X-BAPI-API-KEY": BYBIT_API_KEY,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-RECV-WINDOW": recv_window,
+        "X-BAPI-SIGN-TYPE": "2",
+    }
 
 @retry(
     stop=stop_after_attempt(3),
@@ -475,16 +488,18 @@ def sign_bybit_v5(api_key: str, api_secret: str, timestamp: str, recv_window: st
     retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
 )
 async def bybit_get(session: aiohttp.ClientSession, endpoint: str, params: dict) -> dict:
-    ts = str(now_ms())
-    p = {**params, "api_key": BYBIT_API_KEY, "timestamp": ts, "recv_window": str(RECV_WINDOW)}
-    p["sign"] = sign_bybit(p, BYBIT_API_SECRET)
+    timestamp = str(now_ms())
+    recv_window = str(RECV_WINDOW)
+    query = _build_query(params)
+    sign = sign_bybit_v5(BYBIT_API_KEY, BYBIT_API_SECRET, timestamp, recv_window, query)
+    headers = _headers_v5(sign, timestamp, recv_window)
+
     url = f"{BASE_URL}{endpoint}"
-    async with session.get(url, params=p, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+    async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
         data = await resp.json()
         if data.get("retCode") != 0:
             raise ValueError(f"API error: {data}")
         return data.get("result", {})
-
 
 @retry(
     stop=stop_after_attempt(3),
@@ -495,46 +510,23 @@ async def bybit_post(session: aiohttp.ClientSession, endpoint: str, params: dict
     timestamp = str(now_ms())
     recv_window = str(RECV_WINDOW)
 
-    body = {
-        **params,
-        "api_key": BYBIT_API_KEY,
-        "timestamp": timestamp,
-        "recv_window": recv_window,
-    }
+    # IMPORTANT: payload for signing must be the exact JSON string that is sent
+    body_json = json.dumps(params or {}, separators=(",", ":"), ensure_ascii=False)
 
-    body_json = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-    sign = sign_bybit_v5(
-        api_key=BYBIT_API_KEY,
-        api_secret=BYBIT_API_SECRET,
-        timestamp=timestamp,
-        recv_window=recv_window,
-        body=body_json
-    )
+    sign = sign_bybit_v5(BYBIT_API_KEY, BYBIT_API_SECRET, timestamp, recv_window, body_json)
+    headers = _headers_v5(sign, timestamp, recv_window)
 
-    headers = {
-        "Content-Type": "application/json",
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-API-KEY": BYBIT_API_KEY,
-        "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-RECV-WINDOW": recv_window,
-        "X-BAPI-SIGN-TYPE": "2",
-    }
-
-    async with session.post(
-        BASE_URL + endpoint,
-        data=body_json,
-        headers=headers,
-        timeout=aiohttp.ClientTimeout(total=15)
-    ) as resp:
+    url = f"{BASE_URL}{endpoint}"
+    async with session.post(url, data=body_json, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
         data = await resp.json()
         if data.get("retCode") != 0:
-            raise ValueError(data)
+            raise ValueError(f"API error: {data}")
         return data.get("result", {})
-
 
 
 # ==============================
 # MARKET DATA
+
 # ==============================
 async def bybit_tickers_top(session: aiohttp.ClientSession, n: int) -> List[dict]:
     try:
