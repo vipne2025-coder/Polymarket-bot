@@ -26,6 +26,7 @@ Railway:
 """
 
 import os
+import json
 import time
 import math
 import csv
@@ -460,10 +461,13 @@ async def tg_send(session: aiohttp.ClientSession, text: str) -> None:
 # ==============================
 # BYBIT API
 # ==============================
-def sign_bybit(params: dict, secret: str) -> str:
-    query = urllib.parse.urlencode(sorted(params.items()))
-    return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
-
+def sign_bybit_v5(api_key: str, api_secret: str, timestamp: str, recv_window: str, body: str) -> str:
+    msg = f"{timestamp}{api_key}{recv_window}{body}"
+    return hmac.new(
+        api_secret.encode(),
+        msg.encode(),
+        hashlib.sha256
+    ).hexdigest()
 
 @retry(
     stop=stop_after_attempt(3),
@@ -488,15 +492,45 @@ async def bybit_get(session: aiohttp.ClientSession, endpoint: str, params: dict)
     retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
 )
 async def bybit_post(session: aiohttp.ClientSession, endpoint: str, params: dict) -> dict:
-    ts = str(now_ms())
-    p = {**params, "api_key": BYBIT_API_KEY, "timestamp": ts, "recv_window": str(RECV_WINDOW)}
-    p["sign"] = sign_bybit(p, BYBIT_API_SECRET)
-    url = f"{BASE_URL}{endpoint}"
-    async with session.post(url, json=p, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+    timestamp = str(now_ms())
+    recv_window = str(RECV_WINDOW)
+
+    body = {
+        **params,
+        "api_key": BYBIT_API_KEY,
+        "timestamp": timestamp,
+        "recv_window": recv_window,
+    }
+
+    body_json = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+    sign = sign_bybit_v5(
+        api_key=BYBIT_API_KEY,
+        api_secret=BYBIT_API_SECRET,
+        timestamp=timestamp,
+        recv_window=recv_window,
+        body=body_json
+    )
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-BAPI-SIGN": sign,
+        "X-BAPI-API-KEY": BYBIT_API_KEY,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-RECV-WINDOW": recv_window,
+        "X-BAPI-SIGN-TYPE": "2",
+    }
+
+    async with session.post(
+        BASE_URL + endpoint,
+        data=body_json,
+        headers=headers,
+        timeout=aiohttp.ClientTimeout(total=15)
+    ) as resp:
         data = await resp.json()
         if data.get("retCode") != 0:
-            raise ValueError(f"API error: {data}")
+            raise ValueError(data)
         return data.get("result", {})
+
 
 
 # ==============================
@@ -1219,3 +1253,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
