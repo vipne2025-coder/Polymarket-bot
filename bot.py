@@ -388,48 +388,56 @@ def atr_pct_fast(candles: List[Candle], length: int) -> float:
 
 
 def adx_value(candles: List[Candle], length: int) -> float:
-    """Wilder ADX (last value)."""
+    """Correct Wilder ADX (last value), bounded to 0..100.
+
+    Uses Wilder's RMA (EMA with alpha=1/n) for TR, +DM, -DM and DX.
+    """
     if len(candles) < length + 2:
         return 0.0
+
     highs = np.array([c.h for c in candles], dtype=float)
     lows = np.array([c.l for c in candles], dtype=float)
     closes = np.array([c.c for c in candles], dtype=float)
 
-    up_move = highs[1:] - highs[:-1]
-    down_move = lows[:-1] - lows[1:]
+    up = highs[1:] - highs[:-1]
+    down = lows[:-1] - lows[1:]
 
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
 
     tr1 = highs[1:] - lows[1:]
     tr2 = np.abs(highs[1:] - closes[:-1])
     tr3 = np.abs(lows[1:] - closes[:-1])
     tr = np.maximum.reduce([tr1, tr2, tr3])
 
-    def wilder_smooth(x: np.ndarray, n: int) -> np.ndarray:
-        out = np.zeros_like(x)
-        out[:n] = np.nan
-        if len(x) <= n:
+    def wilder_rma(x: np.ndarray, n: int) -> np.ndarray:
+        out = np.full_like(x, np.nan, dtype=float)
+        if len(x) < n:
             return out
-        out[n] = np.sum(x[:n])
-        for i in range(n + 1, len(x)):
-            out[i] = out[i - 1] - (out[i - 1] / n) + x[i]
+        out[n - 1] = np.mean(x[:n])
+        alpha = 1.0 / n
+        for i in range(n, len(x)):
+            out[i] = out[i - 1] + alpha * (x[i] - out[i - 1])
         return out
 
-    tr_s = wilder_smooth(tr, length)
-    plus_s = wilder_smooth(plus_dm, length)
-    minus_s = wilder_smooth(minus_dm, length)
+    atr = wilder_rma(tr, length)
+    p_dm = wilder_rma(plus_dm, length)
+    m_dm = wilder_rma(minus_dm, length)
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        plus_di = 100.0 * (plus_s / tr_s)
-        minus_di = 100.0 * (minus_s / tr_s)
-        dx = 100.0 * (np.abs(plus_di - minus_di) / (plus_di + minus_di))
+        p_di = 100.0 * (p_dm / atr)
+        m_di = 100.0 * (m_dm / atr)
+        denom = (p_di + m_di)
+        dx = 100.0 * np.abs(p_di - m_di) / denom
 
-    adx = wilder_smooth(np.nan_to_num(dx), length)
-    last = adx[-1]
-    if np.isnan(last) or not np.isfinite(last):
+    dx = np.nan_to_num(dx, nan=0.0, posinf=0.0, neginf=0.0)
+    adx = wilder_rma(dx, length)
+
+    last = float(adx[-1]) if len(adx) else 0.0
+    if not np.isfinite(last):
         return 0.0
-    return float(last)
+    return float(max(0.0, min(100.0, last)))
+
 
 
 def detect_regime(adx: float, atrp: float) -> str:
@@ -1245,4 +1253,8 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
 
