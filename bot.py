@@ -144,6 +144,20 @@ OB_LIMIT = env_int("OB_LIMIT", 25)
 OB_IMB_MIN = env_float("OB_IMB_MIN", 0.10)
 MAX_SPREAD_PCT = env_float("MAX_SPREAD_PCT", 0.12)
 
+
+# Flow / derivatives context filters (optional)
+USE_FUNDING_FILTER = env_bool_01("USE_FUNDING_FILTER", 0)
+FUNDING_MAX_LONG = env_float("FUNDING_MAX_LONG", 0.0006)   # 0.06%
+FUNDING_MIN_SHORT = env_float("FUNDING_MIN_SHORT", -0.0006)
+
+USE_OI_FILTER = env_bool_01("USE_OI_FILTER", 0)
+OI_INTERVAL = os.getenv("OI_INTERVAL", "15min")            # 5min/15min/30min/1h/4h/1d
+OI_LOOKBACK_MIN = env_int("OI_LOOKBACK_MIN", 30)           # lookback window in minutes
+OI_MIN_DELTA_PCT = env_float("OI_MIN_DELTA_PCT", 1.0)      # require |ΔOI| >= X% to confirm
+
+USE_CVD_FILTER = env_bool_01("USE_CVD_FILTER", 0)
+CVD_WINDOW_SEC = env_int("CVD_WINDOW_SEC", 120)            # seconds
+CVD_MIN_QUOTE = env_float("CVD_MIN_QUOTE", 5000.0)         # quote volume delta threshold
 # Walls (optional)
 ENABLE_WALL_FILTER = env_bool_01("ENABLE_WALL_FILTER", 0)
 WALL_TOP_N = env_int("WALL_TOP_N", 10)
@@ -207,6 +221,9 @@ ALLOWED_QUOTE = env_str("ALLOWED_QUOTE", "USDT")
 KLINE_CACHE = TTLCache(maxsize=800, ttl=60)
 OB_RAW_CACHE = TTLCache(maxsize=800, ttl=30)
 TREND_CACHE = TTLCache(maxsize=800, ttl=180)
+FUNDING_CACHE = TTLCache(maxsize=800, ttl=300)
+OI_CACHE = TTLCache(maxsize=800, ttl=60)
+CVD_CACHE = TTLCache(maxsize=800, ttl=5)
 INSTR_CACHE: Dict[str, Dict[str, float]] = {}
 
 COOLDOWN: Dict[str, float] = {}
@@ -252,6 +269,9 @@ class Signal:
     regime: str
     bid_wall: int
     ask_wall: int
+    funding_rate: float = 0.0
+    oi_delta_pct: float = 0.0
+    cvd_delta_quote: float = 0.0
 
 
 # ==============================
@@ -599,6 +619,112 @@ async def bybit_orderbook_raw(session: aiohttp.ClientSession, symbol: str, limit
         logger.error(f"Failed to fetch orderbook for {symbol}: {e}")
         return [], []
 
+async def bybit_funding_rate(session: aiohttp.ClientSession, symbol: str) -> float:
+    """Latest funding rate (float). Uses /v5/market/history-fund-rate."""
+    ck = f"fund:{symbol}"
+    if ck in FUNDING_CACHE:
+        return FUNDING_CACHE[ck]
+    params = {"category": ALLOWED_CATEGORY, "symbol": symbol, "limit": 1}
+    res = await bybit_get(session, "/v5/market/history-fund-rate", params)
+    # result.list: [{fundingRate, fundingRateTimestamp, ...}]
+    lst = res.get("list") or []
+    fr = 0.0
+    if lst:
+        try:
+            fr = float(lst[0].get("fundingRate", 0.0))
+        except Exception:
+            fr = 0.0
+    FUNDING_CACHE[ck] = fr
+    return fr
+
+async def bybit_open_interest_delta(session: aiohttp.ClientSession, symbol: str) -> float:
+    """Open interest % change over the last OI_LOOKBACK_MIN (float, can be negative)."""
+    ck = f"oi:{symbol}:{OI_INTERVAL}:{OI_LOOKBACK_MIN}"
+    if ck in OI_CACHE:
+        return OI_CACHE[ck]
+    end = now_ms()
+    start = end - int(OI_LOOKBACK_MIN * 60 * 1000)
+    params = {
+        "category": ALLOWED_CATEGORY,
+        "symbol": symbol,
+        "intervalTime": OI_INTERVAL,
+        "startTime": start,
+        "endTime": end,
+        "limit": 2,
+    }
+    res = await bybit_get(session, "/v5/market/open-interest", params)
+    lst = res.get("list") or []
+    delta_pct = 0.0
+    if len(lst) >= 2:
+        # list is usually newest-first; handle both
+        try:
+            oi_vals = []
+            for it in lst:
+                oi_vals.append(float(it.get("openInterest", 0.0)))
+            oi_old = oi_vals[-1]
+            oi_new = oi_vals[0]
+            if oi_old > 0:
+                delta_pct = (oi_new - oi_old) / oi_old * 100.0
+        except Exception:
+            delta_pct = 0.0
+    OI_CACHE[ck] = delta_pct
+    return delta_pct
+
+async def bybit_cvd_delta_quote(session: aiohttp.ClientSession, symbol: str) -> float:
+    """CVD-like delta using recent public trades (quote volume buy - sell) over CVD_WINDOW_SEC."""
+    ck = f"cvd:{symbol}:{CVD_WINDOW_SEC}"
+    if ck in CVD_CACHE:
+        return CVD_CACHE[ck]
+    params = {"category": ALLOWED_CATEGORY, "symbol": symbol, "limit": 200}
+    res = await bybit_get(session, "/v5/market/recent-trade", params)
+    lst = res.get("list") or []
+    cutoff = now_ms() - int(CVD_WINDOW_SEC * 1000)
+    buy_q = 0.0
+    sell_q = 0.0
+    for t in lst:
+        try:
+            ts = int(t.get("time", 0))
+            if ts < cutoff:
+                continue
+            side = t.get("side", "")
+            price = float(t.get("price", 0.0))
+            size = float(t.get("size", 0.0))
+            q = price * size
+            if side == "Buy":
+                buy_q += q
+            else:
+                sell_q += q
+        except Exception:
+            continue
+    delta = buy_q - sell_q
+    CVD_CACHE[ck] = delta
+    return delta
+
+def passes_funding_filter(side: str, funding_rate: float) -> bool:
+    if not USE_FUNDING_FILTER:
+        return True
+    if side == "Buy":
+        return funding_rate <= FUNDING_MAX_LONG
+    else:
+        return funding_rate >= FUNDING_MIN_SHORT
+
+def passes_oi_filter(side: str, oi_delta_pct: float) -> bool:
+    if not USE_OI_FILTER:
+        return True
+    # require absolute delta
+    if abs(oi_delta_pct) < OI_MIN_DELTA_PCT:
+        return False
+    # optional directional sanity: in strong continuation, OI often grows with move
+    # We keep it light: just require magnitude unless you want directional constraints.
+    return True
+
+def passes_cvd_filter(side: str, cvd_delta_quote: float) -> bool:
+    if not USE_CVD_FILTER:
+        return True
+    if side == "Buy":
+        return cvd_delta_quote >= CVD_MIN_QUOTE
+    else:
+        return cvd_delta_quote <= -CVD_MIN_QUOTE
 
 def _wall_near_level(level: float, rows: List[List[str]], top_n: int) -> int:
     if not ENABLE_WALL_FILTER or top_n <= 0 or level <= 0:
@@ -942,7 +1068,7 @@ async def detect_signal(session: aiohttp.ClientSession, symbol: str) -> Optional
         if not confirm_bos(conf, "Buy", look):
             return None
 
-        if USE_ORDERBOOK and imb < OB_IMB_MIN:
+        if USE_ORDERBOOK and (not USE_CVD_FILTER) and imb < OB_IMB_MIN:
             return None
         if ENABLE_WALL_FILTER and bid_wall == 0:
             return None
@@ -958,6 +1084,25 @@ async def detect_signal(session: aiohttp.ClientSession, symbol: str) -> Optional
         rr = (tp1 - mid) / risk if risk > 0 else 0.0
         if rr < min_rr_eff:
             return None
+
+        funding_rate = 0.0
+        oi_delta_pct = 0.0
+        cvd_delta_quote = 0.0
+
+        if USE_FUNDING_FILTER:
+            funding_rate = await bybit_funding_rate(session, symbol)
+            if not passes_funding_filter("Buy", funding_rate):
+                return None
+
+        if USE_OI_FILTER:
+            oi_delta_pct = await bybit_open_interest_delta(session, symbol)
+            if not passes_oi_filter("Buy", oi_delta_pct):
+                return None
+
+        if USE_CVD_FILTER:
+            cvd_delta_quote = await bybit_cvd_delta_quote(session, symbol)
+            if not passes_cvd_filter("Buy", cvd_delta_quote):
+                return None
 
         return Signal(
             signal_id=f"{symbol}_{now_ms()}",
@@ -978,6 +1123,9 @@ async def detect_signal(session: aiohttp.ClientSession, symbol: str) -> Optional
             regime=regime,
             bid_wall=bid_wall,
             ask_wall=ask_wall,
+            funding_rate=funding_rate,
+            oi_delta_pct=oi_delta_pct,
+            cvd_delta_quote=cvd_delta_quote,
         )
 
     if near_high and candle_rejection_at_edge(last, hi, False, wick_min):
@@ -988,7 +1136,7 @@ async def detect_signal(session: aiohttp.ClientSession, symbol: str) -> Optional
         if not confirm_bos(conf, "Sell", look):
             return None
 
-        if USE_ORDERBOOK and imb > -OB_IMB_MIN:
+        if USE_ORDERBOOK and (not USE_CVD_FILTER) and imb > -OB_IMB_MIN:
             return None
         if ENABLE_WALL_FILTER and ask_wall == 0:
             return None
@@ -1004,6 +1152,25 @@ async def detect_signal(session: aiohttp.ClientSession, symbol: str) -> Optional
         rr = (mid - tp1) / risk if risk > 0 else 0.0
         if rr < min_rr_eff:
             return None
+
+        funding_rate = 0.0
+        oi_delta_pct = 0.0
+        cvd_delta_quote = 0.0
+
+        if USE_FUNDING_FILTER:
+            funding_rate = await bybit_funding_rate(session, symbol)
+            if not passes_funding_filter("Sell", funding_rate):
+                return None
+
+        if USE_OI_FILTER:
+            oi_delta_pct = await bybit_open_interest_delta(session, symbol)
+            if not passes_oi_filter("Sell", oi_delta_pct):
+                return None
+
+        if USE_CVD_FILTER:
+            cvd_delta_quote = await bybit_cvd_delta_quote(session, symbol)
+            if not passes_cvd_filter("Sell", cvd_delta_quote):
+                return None
 
         return Signal(
             signal_id=f"{symbol}_{now_ms()}",
@@ -1024,6 +1191,9 @@ async def detect_signal(session: aiohttp.ClientSession, symbol: str) -> Optional
             regime=regime,
             bid_wall=bid_wall,
             ask_wall=ask_wall,
+            funding_rate=funding_rate,
+            oi_delta_pct=oi_delta_pct,
+            cvd_delta_quote=cvd_delta_quote,
         )
 
     return None
@@ -1253,8 +1423,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
-
